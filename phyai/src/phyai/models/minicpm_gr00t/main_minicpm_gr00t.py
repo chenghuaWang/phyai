@@ -69,6 +69,7 @@ class MiniCPMGR00TArgs(EntryArgs):
     weight_strict: bool = True
     gdn_backend: str = "fla"
     norm_backend: str = "phyai-kernel"
+    vlm_params_dtype: torch.dtype = torch.bfloat16
     action_params_dtype: torch.dtype = torch.bfloat16
 
 
@@ -88,7 +89,7 @@ class MiniCPMGR00TEntry(Entry):
         config = args.config or MiniCPMGR00TConfig()
         self.model = MiniCPMGR00TModel(
             config,
-            vlm_params_dtype=torch.bfloat16,
+            vlm_params_dtype=args.vlm_params_dtype,
             action_params_dtype=args.action_params_dtype,
             gdn_backend=args.gdn_backend,
             norm_backend=args.norm_backend,

@@ -1523,6 +1523,7 @@ class MiniCPMGR00TModel(nn.Module):
         if device is None:
             device = get_engine_config().device.target
         self.config = config
+        self.vlm_params_dtype = vlm_params_dtype
         self.action_params_dtype = action_params_dtype
         self.vlm = MiniCPMGR00TVLM(
             config,

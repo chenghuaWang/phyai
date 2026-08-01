@@ -40,10 +40,11 @@ def _causal_conv1d_silu_split_kernel(
     for kernel_idx in range(KERNEL_SIZE):
         source_time = time + kernel_idx - (KERNEL_SIZE - 1)
         source_mask = channel_mask & (source_time >= 0)
+        safe_source_time = tl.maximum(source_time, 0)
         source = tl.load(
             x_ptr
             + batch * x_batch_stride
-            + source_time * x_token_stride
+            + safe_source_time * x_token_stride
             + channels * x_channel_stride,
             mask=source_mask,
             other=0.0,
@@ -70,19 +71,21 @@ def _causal_conv1d_silu_split_kernel(
     )
 
     second_channels = channels - FIRST_SIZE
+    safe_second_channels = tl.maximum(second_channels, 0)
     second_mask = (
         channel_mask & (second_channels >= 0) & (second_channels < SECOND_SIZE)
     )
     tl.store(
-        second_ptr + token * SECOND_SIZE + second_channels,
+        second_ptr + token * SECOND_SIZE + safe_second_channels,
         output.to(second_ptr.dtype.element_ty),
         mask=second_mask,
     )
 
     third_channels = channels - FIRST_SIZE - SECOND_SIZE
+    safe_third_channels = tl.maximum(third_channels, 0)
     third_mask = channel_mask & (third_channels >= 0) & (third_channels < THIRD_SIZE)
     tl.store(
-        third_ptr + token * THIRD_SIZE + third_channels,
+        third_ptr + token * THIRD_SIZE + safe_third_channels,
         output.to(third_ptr.dtype.element_ty),
         mask=third_mask,
     )
@@ -107,6 +110,11 @@ def causal_conv1d_silu_split_qkv(
             "phyai_kernel.triton.causal_conv1d_silu_split_qkv: tensors must "
             "live on CUDA"
         )
+    if x.device != weight.device:
+        raise RuntimeError(
+            "phyai_kernel.triton.causal_conv1d_silu_split_qkv: x and weight "
+            "must live on the same CUDA device"
+        )
     if x.ndim != 3:
         raise RuntimeError(
             "phyai_kernel.triton.causal_conv1d_silu_split_qkv: x must be 3D"
@@ -115,6 +123,12 @@ def causal_conv1d_silu_split_qkv(
         raise RuntimeError(
             "phyai_kernel.triton.causal_conv1d_silu_split_qkv: weight must "
             "have shape (C, 1, K)"
+        )
+    supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+    if x.dtype not in supported_dtypes or weight.dtype not in supported_dtypes:
+        raise RuntimeError(
+            "phyai_kernel.triton.causal_conv1d_silu_split_qkv: x and weight "
+            "must use float16, bfloat16, or float32"
         )
     if x.stride(-1) != 1 or weight.stride(-1) != 1:
         raise RuntimeError(
@@ -131,9 +145,16 @@ def causal_conv1d_silu_split_qkv(
             "phyai_kernel.triton.causal_conv1d_silu_split_qkv: input and "
             "weight dtypes must match"
         )
-    if len(split_sizes) != 3 or any(size <= 0 for size in split_sizes):
+    if (
+        not isinstance(split_sizes, tuple)
+        or len(split_sizes) != 3
+        or any(
+            not isinstance(size, int) or isinstance(size, bool) or size <= 0
+            for size in split_sizes
+        )
+    ):
         raise ValueError(
-            f"split_sizes must contain three positive values, got {split_sizes}."
+            f"split_sizes must contain three positive integers, got {split_sizes}."
         )
     if sum(split_sizes) != x.shape[-1]:
         raise ValueError(

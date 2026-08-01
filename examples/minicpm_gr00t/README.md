@@ -1,8 +1,7 @@
 # MiniCPM-GR00T local deployment
 
-This guide runs the MiniCPM-V 4.6 + GR00T unified-80D policy through the
-PhyAI Engine. It covers local inference only; PhyAI does not expose a standalone
-network service in this example.
+Use this example to run the MiniCPM-V 4.6 + GR00T unified-80D policy with the
+PhyAI Engine. It runs local inference only and does not start a network service.
 
 ## Requirements
 
@@ -12,19 +11,18 @@ network service in this example.
 - A compatible MiniCPM-GR00T checkpoint (`.pth` or safetensors)
 - The MiniCPM-V 4.6 processor/tokenizer directory
 
-The original `.pth` checkpoint is loaded directly and does not need conversion.
+PhyAI loads the original `.pth` checkpoint directly, so no conversion is needed.
 
 ## Install
 
-From the repository root:
+Run the following command from the repository root:
 
 ```bash
 uv sync
 ```
 
 `uv sync` creates `.venv` and installs the workspace packages and their locked
-dependencies. Use `uv run` for the commands below so they run in that
-environment.
+dependencies. Run the commands below with `uv run` so they use that environment.
 
 ## Run one inference
 
@@ -40,9 +38,9 @@ uv run python examples/minicpm_gr00t/run_minicpm_gr00t.py \
   --seed 123
 ```
 
-With no `--image` arguments, the example uses two deterministic blank 224×224
-RGB frames. For real inputs, pass exactly two images in base-camera, wrist-camera
-order:
+When you omit `--image`, the example uses two deterministic blank 224×224 RGB
+frames. For real inputs, pass exactly two images, with the base-camera image
+first and the wrist-camera image second:
 
 ```bash
 PHYAI_USE_CUDA_GRAPH=1 \
@@ -56,9 +54,9 @@ uv run python examples/minicpm_gr00t/run_minicpm_gr00t.py \
   --save-actions /tmp/minicpm_gr00t_actions.pt
 ```
 
-A successful run reports an action tensor with shape `(1, 30, 80)`, dtype
-`torch.float32`, and `finite=True`. The first run can take longer because kernels
-and the CUDA Graph are initialized.
+The script prints an action tensor with shape `(1, 30, 80)`, dtype
+`torch.float32`, and `finite=True`. The first run can take longer while the
+kernels and CUDA Graph are initialized.
 
 ## Verify
 
@@ -72,5 +70,5 @@ uv run ruff check \
   phyai-utils-tools/tests/test_minicpm_gr00t_processor.py
 ```
 
-Do not treat fixed-input numerical checks as task-level accuracy. Closed-loop
-policy quality must be evaluated separately on a benchmark such as LIBERO.
+Fixed-input numerical checks are not a measure of task-level accuracy. Evaluate
+closed-loop policy quality separately on a benchmark such as LIBERO.

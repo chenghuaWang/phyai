@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -71,6 +72,16 @@ def rmsnorm_silu_mul(
         raise RuntimeError(
             "phyai_kernel.triton.rmsnorm_silu_mul: tensors must live on CUDA"
         )
+    if x.device != gate.device or x.device != weight.device:
+        raise RuntimeError(
+            "phyai_kernel.triton.rmsnorm_silu_mul: x, gate, and weight must "
+            "live on the same CUDA device"
+        )
+    if x.ndim == 0:
+        raise RuntimeError(
+            "phyai_kernel.triton.rmsnorm_silu_mul: x and gate must have at "
+            "least one dimension"
+        )
     if x.shape != gate.shape:
         raise RuntimeError(
             "phyai_kernel.triton.rmsnorm_silu_mul: x and gate shapes must match"
@@ -78,6 +89,12 @@ def rmsnorm_silu_mul(
     if x.dtype != gate.dtype:
         raise RuntimeError(
             "phyai_kernel.triton.rmsnorm_silu_mul: x and gate dtypes must match"
+        )
+    supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+    if x.dtype not in supported_dtypes or weight.dtype not in supported_dtypes:
+        raise RuntimeError(
+            "phyai_kernel.triton.rmsnorm_silu_mul: x, gate, and weight must "
+            "use float16, bfloat16, or float32"
         )
     if not x.is_contiguous() or not gate.is_contiguous():
         raise RuntimeError(
@@ -88,16 +105,40 @@ def rmsnorm_silu_mul(
             "phyai_kernel.triton.rmsnorm_silu_mul: weight must be 1D and match "
             "the input hidden size"
         )
+    if not weight.is_contiguous():
+        raise RuntimeError(
+            "phyai_kernel.triton.rmsnorm_silu_mul: weight must be contiguous"
+        )
     n_cols = x.shape[-1]
+    if n_cols <= 0:
+        raise RuntimeError(
+            "phyai_kernel.triton.rmsnorm_silu_mul: hidden size must be positive"
+        )
     if n_cols > _SINGLE_BLOCK_MAX:
         raise RuntimeError(
             f"phyai_kernel.triton.rmsnorm_silu_mul: hidden size {n_cols} exceeds "
             f"the supported maximum {_SINGLE_BLOCK_MAX}"
         )
+    if (
+        isinstance(eps, bool)
+        or not isinstance(eps, (int, float))
+        or not math.isfinite(eps)
+        or eps <= 0
+    ):
+        raise ValueError(
+            f"phyai_kernel.triton.rmsnorm_silu_mul: eps must be finite and "
+            f"positive, got {eps!r}"
+        )
+    eps = float(eps)
 
     if out is None:
         out_t = torch.empty_like(x)
     else:
+        if not out.is_cuda or out.device != x.device:
+            raise RuntimeError(
+                "phyai_kernel.triton.rmsnorm_silu_mul: out must live on the "
+                "same CUDA device as x"
+            )
         if out.shape != x.shape or out.dtype != x.dtype or not out.is_contiguous():
             raise RuntimeError(
                 "phyai_kernel.triton.rmsnorm_silu_mul: out must match x and be contiguous"

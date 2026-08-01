@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
@@ -13,6 +14,10 @@ from phyai.layers.rotary_embedding import (
 from phyai.models.minicpm_gr00t.modeling_minicpm_gr00t import MiniCPMGR00TModel
 from phyai.runtime.cuda_graph_manager import CudaGraph, CudaGraphRegistry
 from phyai.runtime.model_runner import ModelRunner
+from phyai.utils.logging import this_rank_log
+
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -199,6 +204,7 @@ class MiniCPMGR00TModelRunner(ModelRunner):
         self.model = model
         self.device = torch.device(device)
         self.config = model.config
+        self.vlm_dtype = model.vlm_params_dtype
         self.action_dtype = model.action_params_dtype
         self.use_cuda_graph = bool(use_cuda_graph) and self.device.type == "cuda"
         self._vlm_graphs = CudaGraphRegistry()
@@ -353,7 +359,7 @@ class MiniCPMGR00TModelRunner(ModelRunner):
             "input_ids": input_ids.to(device=self.device, dtype=torch.int64),
             "pixel_values": pixel_values.to(
                 device=self.device,
-                dtype=torch.bfloat16,
+                dtype=self.vlm_dtype,
             ),
         }
         graph_key = (
@@ -361,6 +367,7 @@ class MiniCPMGR00TModelRunner(ModelRunner):
             tuple(graph_inputs["pixel_values"].shape),
             source_sizes,
         )
+        # TODO(yuezhi): Clone VLM graph outputs if callers retain them across replays.
         if self.use_cuda_graph:
             graph = self._vlm_graphs.get(graph_key)
             if graph is not None:
@@ -377,6 +384,14 @@ class MiniCPMGR00TModelRunner(ModelRunner):
         if not self.use_cuda_graph:
             return self._encode_vlm_core(**graph_inputs, layout=layout)
 
+        this_rank_log(
+            _logger,
+            logging.WARNING,
+            "Capturing MiniCPM-GR00T VLM CUDA graph for uncached key %r "
+            "(%d graphs cached).",
+            graph_key,
+            len(self._vlm_graphs),
+        )
         graph = CudaGraph()
 
         def _forward(
@@ -543,6 +558,14 @@ class MiniCPMGR00TModelRunner(ModelRunner):
         )
         graph = self._action_graphs.get(graph_key)
         if graph is None:
+            this_rank_log(
+                _logger,
+                logging.WARNING,
+                "Capturing MiniCPM-GR00T action CUDA graph for uncached key %r "
+                "(%d graphs cached).",
+                graph_key,
+                len(self._action_graphs),
+            )
             graph = CudaGraph()
             graph.capture(self._predict_actions_loop, graph_inputs)
             self._action_graphs.register(graph_key, graph)
