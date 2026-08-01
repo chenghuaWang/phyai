@@ -60,24 +60,6 @@ A successful run reports an action tensor with shape `(1, 30, 80)`, dtype
 `torch.float32`, and `finite=True`. The first run can take longer because kernels
 and the CUDA Graph are initialized.
 
-## Benchmark
-
-Use warmup iterations and exclude them from the timed sample:
-
-```bash
-PHYAI_USE_CUDA_GRAPH=1 \
-uv run python benchmark/minicpm_gr00t_random_smoke.py \
-  --checkpoint "${CKPT}" \
-  --processor-path "${PROCESSOR}" \
-  --n-warmup 10 \
-  --n-timed 100 \
-  --output-json /tmp/phyai_minicpm_gr00t_benchmark.json
-```
-
-Run benchmarks on an otherwise idle GPU. Compare results only when checkpoint,
-input shape, warmup count, timed count, software environment, and timing scope
-are aligned.
-
 ## Verify
 
 ```bash
@@ -86,7 +68,6 @@ uv run pytest -q \
 
 uv run ruff check \
   examples/minicpm_gr00t \
-  benchmark/minicpm_gr00t_random_smoke.py \
   phyai-utils-tools/src/phyai_utils_tools/models/minicpm_gr00t \
   phyai-utils-tools/tests/test_minicpm_gr00t_processor.py
 ```
