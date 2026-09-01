@@ -17,12 +17,9 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
-import torch
 
-from phyai.layers.linear import _reset_for_test
-from phyai.layers.linear.backend import KernelProbe
 from phyai.parallel.mesh import Mesh
-from phyai.parallel.state import Mode, _meshes, register_mesh
+from phyai.parallel.state import _meshes, register_mesh
 
 
 def _fake_mesh(
@@ -65,80 +62,3 @@ def fake_mesh():
     finally:
         _meshes.clear()
         _meshes.update(saved)
-        _reset_for_test()
-
-
-# ---------------------------------------------------------------------------
-# Shared FakeKernel + probe helper (used by test_registry / test_dispatch)
-# ---------------------------------------------------------------------------
-
-
-class FakeKernel:
-    """Configurable stand-in for a real LinearKernel."""
-
-    def __init__(
-        self,
-        name: str,
-        *,
-        specs: set[str],
-        modes: set[Mode],
-        capture: bool = True,
-        min_sm: int = 0,
-    ) -> None:
-        self.name = name
-        self._specs = specs
-        self._modes = modes
-        self._capture = capture
-        self._min_sm = min_sm
-        self.applied = 0
-
-    def supports_capture(self) -> bool:
-        return self._capture
-
-    def can_handle(self, probe: KernelProbe) -> bool:
-        if probe.spec_id not in self._specs:
-            return False
-        if probe.mode not in self._modes:
-            return False
-        if probe.sm < self._min_sm:
-            return False
-        return True
-
-    def apply(self, layer, x, bias):  # pragma: no cover
-        self.applied += 1
-        return torch.empty_like(x)
-
-
-def make_probe(
-    *,
-    spec_id: str = "bf16",
-    M_bucket: int = 1,
-    N: int = 512,
-    K: int = 512,
-    mode: Mode = Mode.EAGER,
-    sm: int = 90,
-    in_dtype: torch.dtype = torch.bfloat16,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> KernelProbe:
-    return KernelProbe(
-        spec_id=spec_id,
-        M_bucket=M_bucket,
-        N=N,
-        K=K,
-        in_dtype=in_dtype,
-        out_dtype=out_dtype,
-        sm=sm,
-        mode=mode,
-    )
-
-
-@pytest.fixture
-def fake_kernel():
-    """Return the :class:`FakeKernel` class for direct instantiation."""
-    return FakeKernel
-
-
-@pytest.fixture
-def probe():
-    """Return the :func:`make_probe` helper."""
-    return make_probe

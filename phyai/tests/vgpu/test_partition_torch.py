@@ -16,12 +16,6 @@ import phyai.vgpu as V
 from phyai.vgpu.exceptions import BackendCapabilityError
 
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="phyai.vgpu requires CUDA",
-)
-
-
 def test_torch_backend_split_by_count_raises():
     V.init(device="cuda:0", backend="torch")
     with pytest.raises(BackendCapabilityError) as ei:

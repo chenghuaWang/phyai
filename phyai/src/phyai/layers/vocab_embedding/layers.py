@@ -34,7 +34,7 @@ import torch.nn as nn
 
 import phyai.parallel as P
 from phyai.engine_config import get_engine_config
-from phyai.layers.linear.dispatch import get_linear_dispatcher
+from phyai.layers.linear.layers import resolve_linear_kernel
 from phyai.layers.quant import AllocationRequest
 from phyai.layers.quant.bf16 import Bf16Spec
 from phyai.layers.vocab_embedding.ops import masked_embedding_lookup
@@ -252,6 +252,7 @@ class ParallelLMHead(nn.Module):
             device if device is not None else get_engine_config().device.target
         )
         self.prefix = prefix
+        self.kernel_role = "lm_head"
 
         mesh_obj = resolve_mesh(mesh)
         self.mesh_name = mesh_obj.name
@@ -314,15 +315,14 @@ class ParallelLMHead(nn.Module):
         self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        kernel = get_linear_dispatcher().select(
-            spec_id=self.spec.spec_id,
+        kernel = resolve_linear_kernel(
+            self,
+            x,
             M=_M_of(x),
             N=self.output_size_per_partition,
             K=self.input_size_per_partition,
-            in_dtype=x.dtype,
-            out_dtype=self.params_dtype,
         )
-        y = kernel.apply(self, x, self.bias)
+        y = kernel.execute(self, x, self.bias)
         if self.gather_output and self.tp_size > 1:
             y = P.all_gather(y, axis=self.axis, dim=-1, mesh=self.mesh_name)
         return y

@@ -9,12 +9,6 @@ import torch.nn.functional as F
 import phyai_kernel
 
 
-CUDA_REQUIRED = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA is required for phyai-kernel Triton tests",
-)
-
-
 def _rmsnorm_silu_mul_reference(
     x: torch.Tensor,
     gate: torch.Tensor,
@@ -29,7 +23,6 @@ def _rmsnorm_silu_mul_reference(
     return (normalized * F.silu(gate.float())).to(dtype)
 
 
-@CUDA_REQUIRED
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(17, 128), (2, 7, 128)])
 def test_rmsnorm_silu_mul_matches_reference(dtype, shape):
@@ -45,7 +38,6 @@ def test_rmsnorm_silu_mul_matches_reference(dtype, shape):
     torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
 
 
-@CUDA_REQUIRED
 def test_rmsnorm_silu_mul_out_argument():
     x = torch.randn(8, 128, dtype=torch.bfloat16, device="cuda")
     gate = torch.randn_like(x)
@@ -57,7 +49,6 @@ def test_rmsnorm_silu_mul_out_argument():
     torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
 
 
-@CUDA_REQUIRED
 def test_rmsnorm_silu_mul_validates_wrapper_contract():
     x = torch.randn(2, 128, device="cuda")
     gate = torch.randn_like(x)
@@ -83,7 +74,6 @@ def test_rmsnorm_silu_mul_validates_wrapper_contract():
         phyai_kernel.rmsnorm_silu_mul(x, gate, weight, out=torch.empty(2, 128))
 
 
-@CUDA_REQUIRED
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("kernel_size", [1, 4, 8])
 def test_causal_conv1d_silu_split_qkv_matches_reference(dtype, kernel_size):
@@ -123,7 +113,6 @@ def test_causal_conv1d_silu_split_qkv_matches_reference(dtype, kernel_size):
         )
 
 
-@CUDA_REQUIRED
 def test_causal_conv1d_silu_split_qkv_validates_wrapper_contract():
     x = torch.randn(2, 7, 12, device="cuda")
     weight = torch.randn(12, 1, 4, device="cuda")

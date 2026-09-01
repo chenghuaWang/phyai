@@ -15,15 +15,9 @@ Test grid covers:
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 import phyai_kernel
-
-if not torch.cuda.is_available():
-    pytest.skip(
-        "CUDA is required for phyai-kernel Triton tests", allow_module_level=True
-    )
 
 
 # --------------------------------------------------------------------------- #

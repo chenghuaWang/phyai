@@ -1,9 +1,9 @@
 """Linear layer integration tests.
 
-Most tests run at ws=1 via a mocked Mesh — the parallel ops bail out
-without touching the dispatcher, so we can exercise layer construction,
-weight allocation, and forward() on CPU. A couple of multi-rank tests
-spin up gloo workers to verify the collective glue really fires at ws>1.
+Most tests run at ws=1 via a mocked Mesh. The parallel ops bail out without
+communication, so we can exercise layer construction, weight allocation, and
+forward() on CUDA. A couple of multi-rank tests spin up gloo workers (CPU
+collectives by design) to verify the collective glue at ws>1.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import phyai.layers.linear as L
-from phyai.parallel.exceptions import NoBackendError
 
 
 # ---------------------------------------------------------------------------
@@ -28,14 +27,8 @@ from phyai.parallel.exceptions import NoBackendError
 # ---------------------------------------------------------------------------
 
 
-def _init_default_dispatcher():
-    """Re-init the dispatcher without flashinfer so tests don't depend on it."""
-    return L.init(register_flashinfer=False, validate=False)
-
-
 def test_replicated_linear_bf16_matches_F_linear(fake_mesh):
     fake_mesh(name="model")
-    _init_default_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=32,
         out_features=16,
@@ -45,7 +38,7 @@ def test_replicated_linear_bf16_matches_F_linear(fake_mesh):
     nn.init.normal_(layer.weight, std=0.05)
     nn.init.normal_(layer.bias, std=0.05)
 
-    x = torch.randn(4, 32, dtype=torch.bfloat16)
+    x = torch.randn(4, 32, dtype=torch.bfloat16, device="cuda")
     y, bias_out = layer(x)
     assert bias_out is None
     ref = F.linear(x, layer.weight, layer.bias)
@@ -54,7 +47,6 @@ def test_replicated_linear_bf16_matches_F_linear(fake_mesh):
 
 def test_replicated_linear_skip_bias_add_returns_bias(fake_mesh):
     fake_mesh()
-    _init_default_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=16,
         out_features=8,
@@ -65,7 +57,7 @@ def test_replicated_linear_skip_bias_add_returns_bias(fake_mesh):
     nn.init.normal_(layer.weight, std=0.05)
     nn.init.normal_(layer.bias, std=0.05)
 
-    x = torch.randn(2, 16, dtype=torch.bfloat16)
+    x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
     y, bias_out = layer(x)
     assert bias_out is layer.bias
     # y should NOT include bias (skip_bias_add=True).
@@ -75,7 +67,6 @@ def test_replicated_linear_skip_bias_add_returns_bias(fake_mesh):
 
 def test_column_parallel_ws1_matches_F_linear(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_default_dispatcher()
     layer = L.ColumnParallelLinear(
         in_features=32,
         out_features=16,
@@ -85,7 +76,7 @@ def test_column_parallel_ws1_matches_F_linear(fake_mesh):
     )
     nn.init.normal_(layer.weight, std=0.05)
 
-    x = torch.randn(5, 32, dtype=torch.bfloat16)
+    x = torch.randn(5, 32, dtype=torch.bfloat16, device="cuda")
     y, _ = layer(x)
     ref = F.linear(x, layer.weight)
     torch.testing.assert_close(y, ref, atol=0, rtol=0)
@@ -95,7 +86,6 @@ def test_column_parallel_ws1_matches_F_linear(fake_mesh):
 
 def test_column_parallel_rejects_indivisible_split(fake_mesh):
     fake_mesh(sizes={"tp": 4})
-    _init_default_dispatcher()
     with pytest.raises(ValueError, match="not divisible"):
         L.ColumnParallelLinear(
             in_features=8,
@@ -107,7 +97,6 @@ def test_column_parallel_rejects_indivisible_split(fake_mesh):
 
 def test_row_parallel_ws1_matches_F_linear(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_default_dispatcher()
     layer = L.RowParallelLinear(
         in_features=32,
         out_features=16,
@@ -117,7 +106,7 @@ def test_row_parallel_ws1_matches_F_linear(fake_mesh):
     )
     nn.init.normal_(layer.weight, std=0.05)
 
-    x = torch.randn(3, 32, dtype=torch.bfloat16)
+    x = torch.randn(3, 32, dtype=torch.bfloat16, device="cuda")
     y, _ = layer(x)
     ref = F.linear(x, layer.weight)
     torch.testing.assert_close(y, ref, atol=0, rtol=0)
@@ -126,7 +115,6 @@ def test_row_parallel_ws1_matches_F_linear(fake_mesh):
 def test_row_parallel_bias_only_on_rank0(fake_mesh):
     """At ws=1 the bias IS added (rank==0)."""
     fake_mesh(sizes={"tp": 1})
-    _init_default_dispatcher()
     layer = L.RowParallelLinear(
         in_features=16,
         out_features=8,
@@ -137,14 +125,13 @@ def test_row_parallel_bias_only_on_rank0(fake_mesh):
     layer.weight.data.zero_()
     layer.bias.data.fill_(3.0)
 
-    x = torch.zeros(2, 16, dtype=torch.bfloat16)
+    x = torch.zeros(2, 16, dtype=torch.bfloat16, device="cuda")
     y, _ = layer(x)
     assert torch.all(y == 3.0)
 
 
 def test_row_parallel_rejects_indivisible_in(fake_mesh):
     fake_mesh(sizes={"tp": 4})
-    _init_default_dispatcher()
     with pytest.raises(ValueError, match="not divisible"):
         L.RowParallelLinear(in_features=30, out_features=16, axis="tp")
 
@@ -156,7 +143,6 @@ def test_row_parallel_rejects_indivisible_in(fake_mesh):
 
 def test_merged_column_construct_fused_weight(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_default_dispatcher()
     layer = L.MergedColumnParallelLinear(
         in_features=32,
         output_sizes=[16, 16],  # gate/up style
@@ -172,7 +158,6 @@ def test_merged_column_construct_fused_weight(fake_mesh):
 
 def test_merged_column_attaches_two_legs(fake_mesh):
     fake_mesh(sizes={"tp": 2})
-    _init_default_dispatcher()
     layer = L.MergedColumnParallelLinear(
         in_features=16,
         output_sizes=[16, 16],
@@ -203,7 +188,6 @@ def test_merged_column_attaches_two_legs(fake_mesh):
 
 def test_merged_column_attaches_with_custom_hf_legs(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_default_dispatcher()
     layer = L.MergedColumnParallelLinear(
         in_features=16,
         output_sizes=[8, 8],
@@ -225,7 +209,6 @@ def test_merged_column_attaches_with_custom_hf_legs(fake_mesh):
 
 def test_qkv_linear_no_gqa_shapes(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_default_dispatcher()
     layer = L.QKVParallelLinear(
         hidden_size=32,
         head_dim=8,
@@ -243,7 +226,6 @@ def test_qkv_linear_no_gqa_shapes(fake_mesh):
 def test_qkv_linear_gqa_replicates_kv(fake_mesh):
     """tp_size=4 with 2 KV heads -> each rank gets the whole KV replicated twice."""
     fake_mesh(sizes={"tp": 4})
-    _init_default_dispatcher()
     layer = L.QKVParallelLinear(
         hidden_size=32,
         head_dim=8,
@@ -263,7 +245,6 @@ def test_qkv_linear_gqa_replicates_kv(fake_mesh):
 
 def test_qkv_linear_rejects_nonmultiple_tp(fake_mesh):
     fake_mesh(sizes={"tp": 3})
-    _init_default_dispatcher()
     with pytest.raises(ValueError, match="multiple of num_kv_heads"):
         L.QKVParallelLinear(
             hidden_size=32,
@@ -277,7 +258,6 @@ def test_qkv_linear_rejects_nonmultiple_tp(fake_mesh):
 
 def test_qkv_linear_attaches_q_k_v_legs(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_default_dispatcher()
     layer = L.QKVParallelLinear(
         hidden_size=16,
         head_dim=4,
@@ -309,7 +289,6 @@ def test_qkv_linear_attaches_q_k_v_legs(fake_mesh):
 
 def test_qkv_linear_attaches_with_custom_hf_legs(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_default_dispatcher()
     layer = L.QKVParallelLinear(
         hidden_size=16,
         head_dim=4,
@@ -330,7 +309,6 @@ def test_qkv_linear_attaches_with_custom_hf_legs(fake_mesh):
 def test_qkv_gqa_replica_share_kv_slot(fake_mesh):
     """tp=4 with 2 KV heads: ranks 0/1 share K/V slot 0; ranks 2/3 share slot 1."""
     fake_mesh(sizes={"tp": 4}, ranks={"tp": 0})
-    _init_default_dispatcher()
     # Build a fake K source with row patterns we can identify after sharding.
     # effective_kv_heads = 4 (tp_size), kv_size_global = 4*8 = 32 rows total.
     # Per-rank kv_local = 32 / 4 = 8 rows.
@@ -395,7 +373,6 @@ def test_qkv_gqa_replica_share_kv_slot(fake_mesh):
 
 def test_replicated_linear_attaches(fake_mesh):
     fake_mesh()
-    _init_default_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=4, out_features=8, bias=True, prefix="block.fc"
     )
@@ -405,7 +382,6 @@ def test_replicated_linear_attaches(fake_mesh):
 
 def test_replicated_linear_nvfp4_loader_quantizes_bf16_weight(fake_mesh):
     fake_mesh()
-    _init_default_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=16,
         out_features=8,
@@ -425,7 +401,6 @@ def test_replicated_linear_nvfp4_loader_quantizes_bf16_weight(fake_mesh):
 
 def test_column_parallel_attaches_tp2_rank1(fake_mesh):
     fake_mesh(sizes={"tp": 2}, ranks={"tp": 1})
-    _init_default_dispatcher()
     layer = L.ColumnParallelLinear(
         in_features=16,
         out_features=32,
@@ -438,12 +413,11 @@ def test_column_parallel_attaches_tp2_rank1(fake_mesh):
     # Apply: source has 32 rows; rank 1 writes rows 16..32 of source into local 16-row tensor.
     disk = torch.arange(32 * 16, dtype=torch.float32).reshape(32, 16)
     layer.weight.weight_loader(layer.weight, disk, None)
-    torch.testing.assert_close(layer.weight.data, disk.narrow(0, 16, 16))
+    torch.testing.assert_close(layer.weight.data.cpu(), disk.narrow(0, 16, 16))
 
 
 def test_row_parallel_attaches_dim1_shard(fake_mesh):
     fake_mesh(sizes={"tp": 4}, ranks={"tp": 2})
-    _init_default_dispatcher()
     layer = L.RowParallelLinear(
         in_features=64,
         out_features=16,
@@ -459,127 +433,145 @@ def test_row_parallel_attaches_dim1_shard(fake_mesh):
     disk_w = torch.arange(16 * 64, dtype=torch.float32).reshape(16, 64)
     layer.weight.weight_loader(layer.weight, disk_w, None)
     # Rank 2 takes columns [32:48) along input dim.
-    torch.testing.assert_close(layer.weight.data, disk_w.narrow(1, 32, 16))
+    torch.testing.assert_close(layer.weight.data.cpu(), disk_w.narrow(1, 32, 16))
 
 
 def test_empty_prefix_skips_attach(fake_mesh):
     fake_mesh()
-    _init_default_dispatcher()
     layer = L.ReplicatedLinear(in_features=4, out_features=8, prefix="")
     # No prefix -> no hf_keys attached -> loader skips this param.
     assert not hasattr(layer.weight, "hf_keys")
 
 
 # ---------------------------------------------------------------------------
-# init() + force-env integration
+# Kernel policy integration
 # ---------------------------------------------------------------------------
 
 
-def test_init_registers_torch_fallback_and_validates(fake_mesh):
-    fake_mesh()
-    d = L.init(register_flashinfer=False, validate=True, sample_specs=["bf16"])
-    assert d is L.get_linear_dispatcher()
-    # Picks TorchKernel for bf16.
-    k = d.select(
-        spec_id="bf16",
-        M=8,
-        N=64,
-        K=64,
-        in_dtype=torch.bfloat16,
-        out_dtype=torch.bfloat16,
-    )
-    assert k.name == "torch"
+def policy_narrowing_gemm_to(tmp_path, pattern: str, *, role: str | None = None):
+    """Write the YAML that replaced the deleted ``force this backend`` setting."""
+
+    import yaml
+
+    match: dict[str, object] = {"op": "gemm"}
+    if role is not None:
+        match["role"] = role
+    document = {
+        "schema": "phyai.kernel/v1",
+        "rules": [
+            {"id": "ab", "priority": 900, "match": match, "restrict_to": pattern}
+        ],
+    }
+    path = tmp_path / "policy.yaml"
+    path.write_text(yaml.safe_dump(document))
+    return path
 
 
-def test_init_force_env_overrides(fake_mesh, monkeypatch):
-    monkeypatch.setenv("PHYAI_FORCE_LINEAR_KERNEL", "torch")
-    fake_mesh()
-    d = L.init(register_flashinfer=True, validate=False)
-    # Even if flashinfer preferred for bf16 prefill, force->torch.
-    k = d.select(
-        spec_id="bf16",
-        M=1024,
-        N=64,
-        K=64,
-        in_dtype=torch.bfloat16,
-        out_dtype=torch.bfloat16,
+def selector_for(path, device: str):
+    from phyai.kernel.bootstrap import resolve_policy
+    from phyai.kernel.config import KernelConfig
+    from phyai.kernel.registry import build_catalog
+    from phyai.kernel.selector import Selector
+
+    catalog = build_catalog()
+    config = KernelConfig(config_path=str(path))
+    return Selector(catalog, resolve_policy(config, catalog), device=device)
+
+
+def bf16_gemm_query(*, role: str = "", M: int = 1024):
+    from phyai.kernel.types import KernelQuery
+
+    return KernelQuery.build(
+        "gemm",
+        role=role,
+        dtype={"input": "bf16", "output": "bf16"},
+        quant={"format": "bf16"},
+        shape={
+            "M": M,
+            "N": 64,
+            "K": 64,
+        },
     )
-    assert k.name == "torch"
+
+
+def test_a_policy_rule_narrows_selection_to_one_backend(fake_mesh, tmp_path):
+    """What ``PHYAI_FORCE_LINEAR_KERNEL=torch`` used to do, in YAML."""
+
+    fake_mesh()
+    path = policy_narrowing_gemm_to(tmp_path, "torch.gemm.*")
+    selector = selector_for(path, "nvidia:SM100")
+    # FlashInfer would otherwise win on priority for a prefill-sized bf16 call.
+    assert selector.explain(bf16_gemm_query()).selected == "torch.gemm.bf16"
+
+
+def test_a_policy_rule_can_narrow_one_role_and_leave_the_rest(fake_mesh, tmp_path):
+    """The thing the deleted global setting could not do.
+
+    It moved *every* linear onto torch. An A/B almost always wants one role —
+    everything else has to stay put, or the measurement means nothing.
+    """
+
+    fake_mesh()
+    path = policy_narrowing_gemm_to(tmp_path, "torch.gemm.*", role="mlp.down")
+    selector = selector_for(path, "nvidia:SM100")
+    assert selector.explain(bf16_gemm_query(role="mlp.down")).selected == (
+        "torch.gemm.bf16"
+    )
+    assert selector.explain(bf16_gemm_query(role="qkv_proj")).selected == (
+        "flashinfer.gemm.bf16"
+    )
+
+
+def test_narrowing_to_an_unavailable_backend_falls_back_rather_than_failing(
+    fake_mesh, tmp_path
+):
+    """A rule, not an override, so it stays soft.
+
+    A strict force would make "use FlashInfer for GEMM" unusable on a CPU box;
+    the rule says where work should go, not that it can.
+    """
+
+    fake_mesh()
+    path = policy_narrowing_gemm_to(tmp_path, "flashinfer.gemm.*")
+    selector = selector_for(path, "cpu")
+    query = bf16_gemm_query(M=8)
+    assert selector.explain(query).selected == "torch.gemm.bf16"
+
+
+def test_narrowing_to_an_unknown_kernel_is_a_load_time_error(fake_mesh, tmp_path):
+    """Caught when the policy loads, not when a forward first runs."""
+
+    from phyai.kernel.policy import PolicyError
+
+    fake_mesh()
+    path = policy_narrowing_gemm_to(tmp_path, "cutlass.gemm.*")
+    with pytest.raises(PolicyError, match="matches no kernel"):
+        selector_for(path, "nvidia:SM100")
 
 
 # ---------------------------------------------------------------------------
-# Hardware-gated validate(): fp8 has no kernel below sm_89, so a pure-bf16
-# deployment on Ampere (sm_86) / CPU (sm_arch -> 0) must still init cleanly.
-# Unsupported specs error lazily at the matmul, never at startup.
+# Runtime capability errors
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "sm, expected",
-    [
-        (0, ["bf16"]),  # CPU
-        (80, ["bf16"]),  # Ampere A100 — no fp8
-        (86, ["bf16"]),  # Ampere A10/A40 — the reported failure
-        (89, ["bf16", "fp8_per_tensor", "fp8_per_channel"]),  # Ada
-        (90, ["bf16", "fp8_per_tensor", "fp8_per_channel"]),  # Hopper
-        (
-            100,
-            [
-                "bf16",
-                "fp8_per_tensor",
-                "fp8_per_channel",
-                "fp8_block_128_128",
-                "nvfp4_block_16_128x4",
-            ],
-        ),
-    ],
-)
-def test_supported_specs_for_sm(sm, expected):
-    assert L.supported_specs_for_sm(sm) == expected
+def test_fp8_on_sm86_reports_arch_rejection():
+    """An unsupported real query names the failed architecture predicate."""
+    from phyai.kernel.call import select
+    from phyai.kernel.selector import NoKernelError
 
-
-def test_init_validate_succeeds_on_sm86_bf16_only(fake_mesh, monkeypatch):
-    """Regression: a bf16-only model on sm_86 used to die in validate()
-    demanding an fp8 kernel that no backend provides below sm_89."""
-    fake_mesh()
-    # init() reads the package-level sm_arch binding to choose which specs
-    # validate() must cover; the dispatcher reads its own binding for _sm.
-    monkeypatch.setattr("phyai.layers.linear.sm_arch", lambda *a, **k: 86)
-    monkeypatch.setattr("phyai.layers.linear.dispatch.sm_arch", lambda *a, **k: 86)
-
-    # No exception: validate only requires the specs sm_86 can actually run.
-    d = L.init(register_flashinfer=False, validate=True)
-
-    # bf16 still resolves to the torch fallback.
-    k = d.select(
-        spec_id="bf16",
-        M=8,
-        N=64,
-        K=64,
-        in_dtype=torch.bfloat16,
-        out_dtype=torch.bfloat16,
-    )
-    assert k.name == "torch"
-
-
-def test_fp8_on_sm86_errors_lazily_at_dispatch_not_init(fake_mesh, monkeypatch):
-    """The user's design intent: unsupported -> don't register, raise at the
-    call site. init() succeeds; the fp8 request is what fails, and clearly."""
-    fake_mesh()
-    monkeypatch.setattr("phyai.layers.linear.sm_arch", lambda *a, **k: 86)
-    monkeypatch.setattr("phyai.layers.linear.dispatch.sm_arch", lambda *a, **k: 86)
-
-    d = L.init(register_flashinfer=False, validate=True)  # does NOT raise
-
-    with pytest.raises(NoBackendError):
-        d.select(
-            spec_id="fp8_per_tensor",
-            M=8,
-            N=64,
-            K=64,
-            in_dtype=torch.float8_e4m3fn,
-            out_dtype=torch.bfloat16,
+    with pytest.raises(NoKernelError) as excinfo:
+        select(
+            "gemm",
+            device="nvidia:SM86",
+            dtype={"input": "bf16", "output": "bf16"},
+            quant={
+                "format": "fp8_e4m3",
+                "granularity": "per_tensor",
+                "scale_dtype": "fp32",
+            },
+            shape={"M": 8, "N": 64, "K": 64},
         )
+    assert "device.arch >= sm89" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -662,7 +654,6 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
 
     torch.manual_seed(0)
     P.init(layout=(world_size,), mesh_dim_names=("tp",), device="cpu", backend="gloo")
-    L.init(register_flashinfer=False, validate=False)
 
     hidden = 16
     inter = 32
@@ -676,6 +667,7 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
         axis="tp",
         bias=False,
         params_dtype=torch.float32,
+        device="cpu",
         prefix="col",
     )
     row = L.RowParallelLinear(
@@ -685,6 +677,7 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
         bias=False,
         reduce_results=False,
         params_dtype=torch.float32,
+        device="cpu",
         prefix="row",
     )
     col.weight.weight_loader(col.weight, W1, None)

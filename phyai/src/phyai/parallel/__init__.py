@@ -20,7 +20,7 @@ CPU / gloo:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Generator
 
 import torch
 import torch.distributed as torch_dist
@@ -223,7 +223,7 @@ def init(
 
 
 @contextmanager
-def on_stream(s: torch.cuda.Stream) -> Iterator[None]:
+def on_stream(s: torch.cuda.Stream) -> Generator[None]:
     """Run the body on stream ``s``. Capture-safe (sub-stream usage works
     inside ``torch.cuda.graph`` as long as both streams are in capture
     state)."""
@@ -249,6 +249,41 @@ def warmup(callable, /, *args, **kwargs) -> object:
     return result
 
 
+def warmup_collectives(axes: tuple[str, ...] | None = None) -> tuple[str, ...]:
+    """Build every communicator up front with one tiny all-reduce per axis.
+
+    NCCL and PyNCCL create their communicators on first use. Left alone,
+    that cost lands inside the first real request — or, worse, inside
+    CUDA-graph capture, where a collective needs its communicator to
+    already exist. Doing it here moves both the latency and the failure
+    mode into startup, where they are attributable.
+
+    Args:
+        axes: mesh axes to warm. ``None`` (the default) warms every axis
+            of the default mesh whose size is > 1; size-1 axes
+            short-circuit in :mod:`phyai.parallel.ops` without touching a
+            process group, so warming them would be a no-op.
+
+    Returns:
+        The axis names actually warmed, for logging by the caller.
+    """
+    if not torch_dist.is_initialized():
+        return ()
+    mesh = default_mesh()
+    candidates = (
+        axes if axes is not None else tuple(mesh.torch_mesh.mesh_dim_names or ())
+    )
+    warmed: list[str] = []
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    for axis in candidates:
+        if mesh.axis_size(axis) <= 1:
+            continue
+        t = torch.zeros(1, dtype=torch.float32, device=device)
+        warmup(all_reduce, t, axis=axis)
+        warmed.append(axis)
+    return tuple(warmed)
+
+
 __all__ = [
     # init / state / mesh
     "init",
@@ -270,6 +305,7 @@ __all__ = [
     # streams / warmup
     "on_stream",
     "warmup",
+    "warmup_collectives",
     # backends (exposed for advanced users to register custom ones)
     "NcclBackend",
     "GlooBackend",

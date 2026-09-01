@@ -1,23 +1,4 @@
-"""phyai — Physical AI. Main library.
-
-Top-level convenience surface. The engine entry points are re-exported
-here so callers can write ``from phyai import Engine, EngineConfig``
-without remembering which submodule each lives in.
-
-The re-exports are **lazy** (PEP 562 ``__getattr__``). ``phyai.engine``
-and ``phyai.engine_config`` transitively import torch, flashinfer, and
-every registered model plugin — several seconds and hundreds of MiB.
-Binding them eagerly here would make even a bare ``import phyai`` (e.g.
-to read :data:`__version__`) pay that whole cost. Deferring to first
-attribute access keeps ``import phyai`` near-instant while
-``from phyai import Engine`` still works.
-
-The functional subpackages (:mod:`phyai.parallel`, :mod:`phyai.layers`,
-:mod:`phyai.vgpu`, :mod:`phyai.cache`, :mod:`phyai.runtime`,
-:mod:`phyai.weights`, :mod:`phyai.payload`, :mod:`phyai.utils`) are
-addressed by their full path
-(``import phyai.parallel as P``) and are intentionally not hoisted here.
-"""
+"""PhyAI. Main library."""
 
 from __future__ import annotations
 
@@ -31,7 +12,7 @@ except PackageNotFoundError:  # raw source tree, not installed
     __version__ = "0.0.0+unknown"
 
 
-# Re-export name -> defining submodule. Resolved lazily on first access.
+# note(chenghua): Re-export name -> defining submodule. Resolved lazily on first access.
 _LAZY: dict[str, str] = {
     # phyai.engine
     "Engine": "phyai.engine",
@@ -42,6 +23,7 @@ _LAZY: dict[str, str] = {
     "BackendConfig": "phyai.engine_config",
     "DeviceConfig": "phyai.engine_config",
     "EngineConfig": "phyai.engine_config",
+    "KernelConfig": "phyai.engine_config",
     "ParallelConfig": "phyai.engine_config",
     "RuntimeConfig": "phyai.engine_config",
     "get_engine_config": "phyai.engine_config",
@@ -57,6 +39,7 @@ if TYPE_CHECKING:
         BackendConfig,
         DeviceConfig,
         EngineConfig,
+        KernelConfig,
         ParallelConfig,
         RuntimeConfig,
         get_engine_config,
@@ -88,6 +71,7 @@ __all__ = [
     "EntryArgs",
     # engine config
     "EngineConfig",
+    "KernelConfig",
     "BackendConfig",
     "DeviceConfig",
     "ParallelConfig",

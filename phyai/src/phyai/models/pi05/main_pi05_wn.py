@@ -5,17 +5,17 @@ load (a full replica per rank), except it sizes the single-card
 :class:`PI05WS1Scheduler` for the per-rank shard and wraps it in a
 :class:`~phyai.models.pi05.scheduler_wn_pi05.PI05WNScheduler`.
 
-The engine bootstrap (``init_dist`` -> ``P.init`` 6-axis mesh -> ``L.init``) runs
-before :meth:`setup`, so the ``dp`` axis is live here and ``per_rank_B`` can be
-derived from it. Drive DP via ``ParallelConfig(world_size=N, dp_size=N,
-tp_size=1)`` and launch one process per rank under ``torchrun`` (see
-``examples/pi05/run_pi05_wn.py``). ``max_batch_size`` on the args is the TOTAL
-batch across all ranks; each rank processes ``ceil(max_batch_size / dp_size)``.
+The engine bootstrap initializes distributed state, the six-axis mesh, and the
+kernel selector before :meth:`setup`, so the ``dp`` axis is live here and
+``per_rank_B`` can be derived from it. Drive DP via
+``ParallelConfig(world_size=N, dp_size=N, tp_size=1)`` and launch one process per
+rank under ``torchrun`` (see ``examples/pi05/run_pi05_wn.py``).
+``max_batch_size`` on the args is the TOTAL batch across all ranks; each rank
+processes ``ceil(max_batch_size / dp_size)``.
 """
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,11 +31,11 @@ from phyai.models.pi05.main_pi05 import PI05Entry, _compose_remap
 from phyai.models.pi05.modeling_pi05 import PI05Model
 from phyai.models.pi05.scheduler_wn_pi05 import PI05WNScheduler, _dp_rank_size
 from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request, PI05WS1Scheduler
-from phyai.utils import load_config, this_rank_log
+from phyai.utils import get_logger, load_config
 from phyai.weights import load_pretrained
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -78,9 +78,6 @@ class PI05WNEntry(Entry):
         else:
             config = PI05Config()
 
-        # Reuse pi05's recommended-engine overlay + num-image validation.
-        eng = PI05Entry._apply_recommended_engine(eng, config)
-
         with use_quant_plan(load_quant_plan(args.checkpoint_dir)):
             self.model = PI05Model(
                 config,
@@ -107,9 +104,7 @@ class PI05WNEntry(Entry):
         )
         self.scheduler = PI05WNScheduler(local, device=eng.device.target)
         self.scheduler.setup()
-        this_rank_log(
-            logger,
-            logging.INFO,
+        logger.info_rank0(
             "pi0.5 DP plugin ready (dp=%d, total_batch=%d, per_rank_B=%d).",
             dp_size,
             args.max_batch_size,

@@ -16,7 +16,6 @@ to a plain single-card run.
 
 from __future__ import annotations
 
-import logging
 
 import torch
 import torch.distributed as dist
@@ -24,10 +23,10 @@ import torch.distributed as dist
 import phyai.parallel as P
 from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request, PI05WS1Scheduler
 from phyai.runtime.schedule import Scheduler
-from phyai.utils import this_rank_log
+from phyai.utils import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _dp_rank_size() -> tuple[int, int]:
@@ -89,9 +88,7 @@ class PI05WNScheduler(Scheduler):
                     f"world."
                 )
         self.local.setup()
-        this_rank_log(
-            logger,
-            logging.INFO,
+        logger.info_rank0(
             "pi0.5 DP scheduler ready (dp=%d, per_rank_B=%d).",
             self.dp_size,
             self.per_rank_B,
@@ -131,13 +128,15 @@ class PI05WNScheduler(Scheduler):
     def _scatter(self, request: PI05Request) -> PI05Request:
         """Rank 0 splits the padded batch and sends each shard; others receive.
 
-        Fields moved: ``pixel_values``/``noise`` (model dtype) and
+        Fields moved: ``pixel_values``/``noise`` (fp32 reference dtype) and
         ``input_ids``/``lang_lens`` (int64). Every rank ends with exactly
         ``per_rank_B`` rows. When ``request.noise is None`` the Router samples one
         noise tensor and scatters it, so all shards share a single noise source.
         """
         R, N, pr = self.dp_rank, self.dp_size, self.per_rank_B
-        dev, dt, cfg = self.device, self.dtype, self.cfg
+        dev, cfg = self.device, self.cfg
+        vision_dt = self.local.vision_input_dtype
+        sampler_dt = self.local.sampler_dtype
         chunk, act = cfg.chunk_size, cfg.max_action_dim
         px_shape = (
             pr,
@@ -152,14 +151,18 @@ class PI05WNScheduler(Scheduler):
 
         if R == 0:
             total = N * pr
-            px = _pad_rows(request.pixel_values.to(dev, dt), total)
+            px = _pad_rows(request.pixel_values.to(dev, vision_dt), total)
             ids = _pad_rows(request.input_ids.to(dev, torch.int64), total)
             lens = _pad_rows(request.lang_lens.to(dev, torch.int64), total)
             if request.noise is not None:
-                noise_src = request.noise.to(dev, dt)
+                noise_src = request.noise.to(dev, sampler_dt)
             else:
                 noise_src = torch.randn(
-                    request.pixel_values.shape[0], chunk, act, device=dev, dtype=dt
+                    request.pixel_values.shape[0],
+                    chunk,
+                    act,
+                    device=dev,
+                    dtype=sampler_dt,
                 )
             noise = _pad_rows(noise_src, total)
 
@@ -178,10 +181,10 @@ class PI05WNScheduler(Scheduler):
                 noise=shard(noise, 0),
             )
 
-        px = P.recv(px_shape, dt, axis="dp", src=0, device=dev)
+        px = P.recv(px_shape, vision_dt, axis="dp", src=0, device=dev)
         ids = P.recv(ids_shape, torch.int64, axis="dp", src=0, device=dev)
         lens = P.recv(lens_shape, torch.int64, axis="dp", src=0, device=dev)
-        noise = P.recv(noise_shape, dt, axis="dp", src=0, device=dev)
+        noise = P.recv(noise_shape, sampler_dt, axis="dp", src=0, device=dev)
         return PI05Request(pixel_values=px, input_ids=ids, lang_lens=lens, noise=noise)
 
     def close(self) -> None:

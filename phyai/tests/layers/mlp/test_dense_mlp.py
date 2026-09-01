@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import phyai.layers.linear as L
 from phyai.layers.mlp import DenseMLP
 from phyai.parallel.mesh import Mesh
 from phyai.parallel.state import _meshes, register_mesh
@@ -46,11 +45,6 @@ def fake_mesh():
     finally:
         _meshes.clear()
         _meshes.update(saved)
-        L._reset_for_test()
-
-
-def _init_dispatcher():
-    return L.init(register_flashinfer=False, validate=False)
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +54,6 @@ def _init_dispatcher():
 
 def test_activation_aliases_resolve_consistently(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     aliases = ("gelu_tanh", "gelu_pytorch_tanh", "gelu-tanh", "gelu_new")
     for alias in aliases:
         m = DenseMLP(
@@ -75,7 +68,6 @@ def test_activation_aliases_resolve_consistently(fake_mesh):
 
 def test_gated_silu_construct_default(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     m = DenseMLP(
         hidden_size=8,
         intermediate_size=16,
@@ -93,7 +85,6 @@ def test_gated_silu_construct_default(fake_mesh):
 
 def test_plain_construct_with_bias(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     m = DenseMLP(
         hidden_size=8,
         intermediate_size=24,
@@ -113,7 +104,6 @@ def test_plain_construct_with_bias(fake_mesh):
 
 def test_plain_silu_rejected(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     with pytest.raises(ValueError, match="non-gated SiLU"):
         DenseMLP(
             hidden_size=8,
@@ -126,7 +116,6 @@ def test_plain_silu_rejected(fake_mesh):
 
 def test_unknown_activation_rejected(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     with pytest.raises(ValueError, match="Unsupported"):
         DenseMLP(
             hidden_size=8,
@@ -144,7 +133,6 @@ def test_unknown_activation_rejected(fake_mesh):
 
 def test_attach_gated_default_names(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     m = DenseMLP(
         hidden_size=8,
         intermediate_size=16,
@@ -164,7 +152,6 @@ def test_attach_gated_default_names(fake_mesh):
 
 def test_attach_gated_custom_legs(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     m = DenseMLP(
         hidden_size=8,
         intermediate_size=16,
@@ -181,7 +168,6 @@ def test_attach_gated_custom_legs(fake_mesh):
 
 def test_attach_plain_path(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     m = DenseMLP(
         hidden_size=8,
         intermediate_size=24,
@@ -201,11 +187,6 @@ def test_attach_plain_path(fake_mesh):
 # ---------------------------------------------------------------------------
 
 
-cuda_only = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="flashinfer act_and_mul needs CUDA"
-)
-
-
 def _load_gated(m: DenseMLP, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor):
     """Load three HF-style tensors via the param-attached weight_loader."""
     m.gate_up_proj.weight.weight_loader(m.gate_up_proj.weight, gate, 0)
@@ -213,10 +194,8 @@ def _load_gated(m: DenseMLP, gate: torch.Tensor, up: torch.Tensor, down: torch.T
     m.down_proj.weight.weight_loader(m.down_proj.weight, down, None)
 
 
-@cuda_only
 def test_forward_gated_silu_matches_torch_reference(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     H, I = 64, 256
     m = DenseMLP(
         hidden_size=H,
@@ -239,10 +218,8 @@ def test_forward_gated_silu_matches_torch_reference(fake_mesh):
     torch.testing.assert_close(y, ref, atol=2e-2, rtol=2e-2)
 
 
-@cuda_only
 def test_forward_gated_gelu_tanh_matches_torch_reference(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     H, I = 64, 256
     m = DenseMLP(
         hidden_size=H,
@@ -269,8 +246,7 @@ def test_forward_gated_gelu_tanh_matches_torch_reference(fake_mesh):
 
 def test_forward_plain_gelu_tanh_matches_torch_reference(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
-    # Plain path uses F.gelu — works on CPU, no flashinfer needed.
+    # Plain path uses F.gelu — the torch reference row, no flashinfer needed.
     H, I = 32, 96
     m = DenseMLP(
         hidden_size=H,
@@ -287,7 +263,7 @@ def test_forward_plain_gelu_tanh_matches_torch_reference(fake_mesh):
     nn.init.normal_(m.fc2.weight, std=0.02)
     nn.init.normal_(m.fc2.bias, std=0.02)
 
-    x = (torch.randn(4, H) * 0.1).to(torch.bfloat16)
+    x = (torch.randn(4, H, device="cuda") * 0.1).to(torch.bfloat16)
     y = m(x)
     h = F.gelu(F.linear(x, m.fc1.weight, m.fc1.bias), approximate="tanh")
     ref = F.linear(h, m.fc2.weight, m.fc2.bias)
@@ -299,17 +275,15 @@ def test_forward_plain_gelu_tanh_matches_torch_reference(fake_mesh):
 # ---------------------------------------------------------------------------
 
 
-@cuda_only
 def test_fused_vs_split_load_produces_identical_output(fake_mesh):
     """Loading via [gate, up] split == pre-concatenated fused weight."""
     fake_mesh()
-    _init_dispatcher()
     H, I = 32, 64
     torch.manual_seed(3)
     gate = (torch.randn(I, H) * 0.02).to(torch.bfloat16).cuda()
     up = (torch.randn(I, H) * 0.02).to(torch.bfloat16).cuda()
     down = (torch.randn(H, I) * 0.02).to(torch.bfloat16).cuda()
-    x = (torch.randn(4, H) * 0.1).to(torch.bfloat16).cuda()
+    x = (torch.randn(4, H, device="cuda") * 0.1).to(torch.bfloat16).cuda()
 
     # Path A: official placements (split gate/up).
     m_a = DenseMLP(

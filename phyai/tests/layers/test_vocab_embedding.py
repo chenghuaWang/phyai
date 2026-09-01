@@ -20,7 +20,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import phyai.layers.linear as L
 from phyai.layers.vocab_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -69,12 +68,6 @@ def fake_mesh():
     finally:
         _meshes.clear()
         _meshes.update(saved)
-        L._reset_for_test()
-
-
-def _init_dispatcher():
-    """Init phyai.layers.linear without flashinfer / sample-spec validation."""
-    return L.init(register_flashinfer=False, validate=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -264,7 +257,7 @@ def test_embedding_tp1_forward_matches_nn_embedding(fake_mesh):
     # in-range gather. The loader writes them; here we initialise manually.
     layer.weight.data[V:].zero_()
 
-    ids = torch.randint(0, V, (4, 8), dtype=torch.int64)
+    ids = torch.randint(0, V, (4, 8), dtype=torch.int64, device="cuda")
     out = layer(ids)
 
     # Reference: plain F.embedding using only the first V rows.
@@ -279,7 +272,7 @@ def test_embedding_tp1_zero_input(fake_mesh):
     )
     nn.init.normal_(layer.weight, std=0.05)
     layer.weight.data[32:].zero_()
-    ids = torch.empty((0,), dtype=torch.int64)
+    ids = torch.empty((0,), dtype=torch.int64, device="cuda")
     out = layer(ids)
     assert out.shape == (0, 8)
 
@@ -291,7 +284,7 @@ def test_embedding_tp1_3d_input_preserves_shape(fake_mesh):
     )
     nn.init.normal_(layer.weight, std=0.05)
     layer.weight.data[64:].zero_()
-    ids = torch.randint(0, 64, (2, 3, 4), dtype=torch.int64)
+    ids = torch.randint(0, 64, (2, 3, 4), dtype=torch.int64, device="cuda")
     out = layer(ids)
     assert out.shape == (2, 3, 4, 12)
     expected = F.embedding(ids, layer.weight[:64])
@@ -305,7 +298,6 @@ def test_embedding_tp1_3d_input_preserves_shape(fake_mesh):
 
 def test_lmhead_tp1_construct_attrs(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     head = ParallelLMHead(
         embedding_dim=16,
         num_embeddings=100,
@@ -331,7 +323,6 @@ def test_lmhead_rejects_bias(fake_mesh):
 
 def test_lmhead_tied_weight_shares_parameter(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     embed = VocabParallelEmbedding(
         num_embeddings=100, embedding_dim=16, params_dtype=torch.float32
     )
@@ -365,7 +356,6 @@ def test_lmhead_tied_weight_rejects_shape_mismatch(fake_mesh):
 
 def test_lmhead_tp1_forward_matches_F_linear(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     head = ParallelLMHead(
         embedding_dim=32,
         num_embeddings=100,
@@ -373,7 +363,7 @@ def test_lmhead_tp1_forward_matches_F_linear(fake_mesh):
     )
     nn.init.normal_(head.weight, std=0.02)
 
-    x = torch.randn(4, 32, dtype=torch.bfloat16)
+    x = torch.randn(4, 32, dtype=torch.bfloat16, device="cuda")
     y = head(x)
     # Reference: x @ weight.T (bias is None).
     ref = F.linear(x, head.weight)
@@ -384,7 +374,6 @@ def test_lmhead_tp1_forward_matches_F_linear(fake_mesh):
 
 def test_lmhead_tied_forward_uses_shared_weight(fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     embed = VocabParallelEmbedding(
         num_embeddings=64, embedding_dim=16, params_dtype=torch.bfloat16
     )
@@ -400,7 +389,7 @@ def test_lmhead_tied_forward_uses_shared_weight(fake_mesh):
     embed.weight.data.fill_(0.5)
     assert torch.all(head.weight.data == 0.5)
 
-    x = torch.randn(2, 16, dtype=torch.bfloat16)
+    x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
     y = head(x)
     ref = F.linear(x, embed.weight)
     torch.testing.assert_close(y, ref, atol=0, rtol=0)
@@ -414,7 +403,6 @@ def test_lmhead_tied_forward_uses_shared_weight(fake_mesh):
 def test_padding_logits_are_zero_after_load(fake_mesh):
     """The whole point of zero-fill padding: out-of-vocab logits stay 0."""
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     V, D = 100, 8
     head = ParallelLMHead(
         embedding_dim=D,
@@ -428,11 +416,11 @@ def test_padding_logits_are_zero_after_load(fake_mesh):
     head.weight.weight_loader(head.weight, disk_w, None)
 
     # First V rows match disk; last V_padded - V are zero.
-    assert torch.equal(head.weight.data[:V], disk_w)
+    assert torch.equal(head.weight.data[:V].cpu(), disk_w)
     assert torch.all(head.weight.data[V:] == 0)
 
     # Forward: any column ≥ V should produce exactly-zero logits regardless of x.
-    x = torch.randn(7, D, dtype=torch.float32)
+    x = torch.randn(7, D, dtype=torch.float32, device="cuda")
     logits = head(x)
     assert torch.all(logits[:, V:] == 0)
 
@@ -493,7 +481,7 @@ def test_embedding_scale_forward_matches_unscaled_times_scale(fake_mesh):
     # Mirror the same weight onto the scaled layer.
     scaled.weight.data.copy_(plain.weight.data)
 
-    ids = torch.randint(0, V, (4, 8), dtype=torch.int64)
+    ids = torch.randint(0, V, (4, 8), dtype=torch.int64, device="cuda")
     out_plain = plain(ids)
     out_scaled = scaled(ids)
     torch.testing.assert_close(out_scaled, out_plain * scale, atol=0, rtol=0)
@@ -511,7 +499,7 @@ def test_embedding_scale_dtype_matches_input(fake_mesh):
     )
     nn.init.normal_(layer.weight, std=0.05)
     layer.weight.data[V:].zero_()
-    ids = torch.randint(0, V, (4,), dtype=torch.int64)
+    ids = torch.randint(0, V, (4,), dtype=torch.int64, device="cuda")
     out = layer(ids)
     assert out.dtype == torch.bfloat16
 
@@ -521,7 +509,6 @@ def test_embedding_scale_does_not_mutate_weight(fake_mesh):
     reason we picked 'A': a tied lm_head must keep seeing the un-scaled weight).
     """
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     V, D = 64, 16
     embed = VocabParallelEmbedding(
         num_embeddings=V,
@@ -533,7 +520,7 @@ def test_embedding_scale_does_not_mutate_weight(fake_mesh):
     embed.weight.data[V:].zero_()
     weight_before = embed.weight.data.clone()
 
-    ids = torch.randint(0, V, (3, 5), dtype=torch.int64)
+    ids = torch.randint(0, V, (3, 5), dtype=torch.int64, device="cuda")
     _ = embed(ids)
 
     torch.testing.assert_close(embed.weight.data, weight_before, atol=0, rtol=0)
@@ -546,7 +533,6 @@ def test_tied_lmhead_sees_unscaled_weight(fake_mesh):
     but the tied lm_head produces ``x @ weight.T`` with the un-scaled weight.
     """
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     V, D = 64, 16
     scale = D**0.5
     embed = VocabParallelEmbedding(
@@ -564,7 +550,7 @@ def test_tied_lmhead_sees_unscaled_weight(fake_mesh):
         params_dtype=torch.float32,
     )
 
-    x = torch.randn(2, D, dtype=torch.float32)
+    x = torch.randn(2, D, dtype=torch.float32, device="cuda")
     y = head(x)
     ref = F.linear(x, embed.weight)  # un-scaled
     ref_scaled = F.linear(x, embed.weight * scale)  # would be wrong

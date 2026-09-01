@@ -16,17 +16,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-import phyai.layers.linear as L
 from phyai.layers import RotaryEmbedding
 from phyai.layers.transformer_block import TransformerBlock
 from phyai.parallel.mesh import Mesh
 from phyai.parallel.state import _meshes, register_mesh
-
-
-cuda_only = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="phyai linear / norm / attention backends are CUDA-only",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -73,11 +66,6 @@ def fake_mesh():
     finally:
         _meshes.clear()
         _meshes.update(saved)
-        L._reset_for_test()
-
-
-def _init_dispatcher():
-    return L.init(register_flashinfer=False, validate=False)
 
 
 def _base_kwargs(**overrides) -> dict:
@@ -95,7 +83,6 @@ def _base_kwargs(**overrides) -> dict:
 
 def test_unknown_norm_type_raises(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     with pytest.raises(ValueError, match="Unknown norm_type"):
         TransformerBlock(
             hidden_size=64,
@@ -107,7 +94,6 @@ def test_unknown_norm_type_raises(fake_mesh):
 
 def test_hidden_size_not_divisible_by_heads_raises(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     with pytest.raises(ValueError, match="not divisible"):
         TransformerBlock(
             hidden_size=65,
@@ -120,7 +106,6 @@ def test_hidden_size_not_divisible_by_heads_raises(fake_mesh):
 def test_default_pre_norm_uses_hf_defaults(fake_mesh):
     """No norm_hf_names passed -> block uses HF defaults."""
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -138,7 +123,6 @@ def test_default_pre_norm_uses_hf_defaults(fake_mesh):
 
 def test_default_sandwich_norm_uses_hf_defaults(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -160,7 +144,6 @@ def test_default_sandwich_norm_uses_hf_defaults(fake_mesh):
 
 def test_norm_hf_names_unknown_key_raises(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     # Old phyai-internal slot names ("input_norm" etc.) are no longer
     # accepted — the new API expects HF default names as keys.
     with pytest.raises(ValueError, match="unknown keys"):
@@ -174,7 +157,6 @@ def test_norm_hf_names_unknown_key_raises(fake_mesh):
 
 def test_norm_hf_names_pre_norm_rejects_sandwich_only_keys(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     # pre_feedforward_layernorm only exists in the sandwich-norm topology.
     with pytest.raises(ValueError, match="unknown keys"):
         TransformerBlock(
@@ -187,7 +169,6 @@ def test_norm_hf_names_pre_norm_rejects_sandwich_only_keys(fake_mesh):
 
 def test_explicit_head_dim_takes_priority(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -201,7 +182,6 @@ def test_explicit_head_dim_takes_priority(fake_mesh):
 
 def test_pre_norm_has_two_norms_only(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -217,7 +197,6 @@ def test_pre_norm_has_two_norms_only(fake_mesh):
 
 def test_sandwich_norm_has_four_norms(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -232,7 +211,6 @@ def test_sandwich_norm_has_four_norms(fake_mesh):
 
 def test_qk_norm_default_off(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -250,7 +228,6 @@ def test_attention_kind_accepts_layer_idx_metadata(fake_mesh):
     but attention treats it as optional inert metadata (surfaced in repr).
     """
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -271,13 +248,12 @@ def test_attention_kind_accepts_layer_idx_metadata(fake_mesh):
             hidden_size=64,
             num_heads=4,
             intermediate_size=128,
-            attn_kind="ar",
+            attn_kind="paged",
         )
 
 
 def test_qk_norm_present_when_enabled(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -295,7 +271,6 @@ def test_qk_norm_present_when_enabled(fake_mesh):
 
 def test_rope_required_when_positions_missing(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     rope = RotaryEmbedding(16, max_position_embeddings=64, backend="eager")
     blk = TransformerBlock(
         hidden_size=64,
@@ -314,7 +289,6 @@ def test_rope_required_when_positions_missing(fake_mesh):
 
 def test_wrong_input_rank_raises(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -331,7 +305,6 @@ def test_wrong_input_rank_raises(fake_mesh):
 
 def test_wrong_hidden_size_raises(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -351,11 +324,9 @@ def test_wrong_hidden_size_raises(fake_mesh):
 # ---------------------------------------------------------------------------
 
 
-@cuda_only
 def test_gemma1_style_forward(fake_mesh):
     """Gemma1 / Llama: pre-norm + RMSNorm + RoPE + gated SiLU + GQA + causal."""
     fake_mesh()
-    _init_dispatcher()
     H, num_heads, kv_heads, head_dim, I = 64, 4, 2, 16, 128
 
     rope = RotaryEmbedding(head_dim, max_position_embeddings=128, backend="eager")
@@ -383,7 +354,6 @@ def test_gemma1_style_forward(fake_mesh):
     assert y.dtype == torch.bfloat16
 
 
-@cuda_only
 def test_precompute_rope_pattern_b_matches_pattern_a(fake_mesh):
     """Pattern B (threaded ``cos`` / ``sin``) == Pattern A (per-layer rope).
 
@@ -392,7 +362,6 @@ def test_precompute_rope_pattern_b_matches_pattern_a(fake_mesh):
     using one shared rope instance and identical weights.
     """
     fake_mesh()
-    _init_dispatcher()
     H, num_heads, kv_heads, head_dim, I = 64, 4, 2, 16, 128
 
     rope = RotaryEmbedding(
@@ -436,11 +405,9 @@ def test_precompute_rope_pattern_b_matches_pattern_a(fake_mesh):
     torch.testing.assert_close(y_b, y_a)
 
 
-@cuda_only
 def test_gemma2_style_sandwich_forward(fake_mesh):
     """Gemma2: sandwich + GemmaRMSNorm + soft_cap + sliding_window + GeGLU."""
     fake_mesh()
-    _init_dispatcher()
     H, num_heads, kv_heads, head_dim, I = 64, 4, 2, 16, 128
 
     rope = RotaryEmbedding(head_dim, max_position_embeddings=128, backend="eager")
@@ -470,11 +437,9 @@ def test_gemma2_style_sandwich_forward(fake_mesh):
     assert y.shape == (1, 12, H)
 
 
-@cuda_only
 def test_gemma3_style_sandwich_qk_norm_forward(fake_mesh):
     """Gemma3: sandwich + GemmaRMSNorm + sliding_window + Q/K head_dim norm + no soft_cap."""
     fake_mesh()
-    _init_dispatcher()
     H, num_heads, kv_heads, head_dim, I = 64, 4, 2, 16, 128
 
     rope = RotaryEmbedding(head_dim, max_position_embeddings=128, backend="eager")
@@ -504,11 +469,9 @@ def test_gemma3_style_sandwich_qk_norm_forward(fake_mesh):
     assert y.shape == (1, 12, H)
 
 
-@cuda_only
 def test_qwen2_style_forward(fake_mesh):
     """Qwen2 / Qwen2.5: pre-norm + RMSNorm + RoPE + gated SiLU + GQA + Q/K/V bias."""
     fake_mesh()
-    _init_dispatcher()
     H, num_heads, kv_heads, head_dim, I = 64, 4, 2, 16, 128
 
     rope = RotaryEmbedding(head_dim, max_position_embeddings=128, backend="eager")
@@ -541,11 +504,9 @@ def test_qwen2_style_forward(fake_mesh):
     assert y.shape == (2, 16, H)
 
 
-@cuda_only
 def test_qwen3_style_forward(fake_mesh):
     """Qwen3: pre-norm + RMSNorm + RoPE + gated SiLU + GQA + Q/K head_dim norm + no QKV bias."""
     fake_mesh()
-    _init_dispatcher()
     H, num_heads, kv_heads, head_dim, I = 64, 4, 2, 16, 128
 
     rope = RotaryEmbedding(head_dim, max_position_embeddings=128, backend="eager")
@@ -579,11 +540,9 @@ def test_qwen3_style_forward(fake_mesh):
     assert y.shape == (2, 16, H)
 
 
-@cuda_only
 def test_siglip_style_forward(fake_mesh):
     """SigLIP encoder: pre-norm + LayerNorm(bias) + plain GELU-tanh MLP + non-causal + out_proj."""
     fake_mesh()
-    _init_dispatcher()
     H, num_heads, head_dim, I = 96, 4, 24, 256
 
     blk = TransformerBlock(
@@ -612,11 +571,9 @@ def test_siglip_style_forward(fake_mesh):
     assert y.shape == (2, 32, H)
 
 
-@cuda_only
 def test_ragged_forward(fake_mesh):
     """2-D ragged input runs through the block and preserves shape."""
     fake_mesh()
-    _init_dispatcher()
     H, num_heads, head_dim, I = 64, 4, 16, 128
 
     rope = RotaryEmbedding(head_dim, max_position_embeddings=64, backend="eager")
@@ -658,7 +615,6 @@ def _hf_keys(blk: TransformerBlock) -> set[str]:
 def test_pre_norm_hf_keys_llama_like(fake_mesh):
     """Llama / Gemma1 / Qwen2 / Mistral convention."""
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -689,7 +645,6 @@ def test_pre_norm_hf_keys_llama_like(fake_mesh):
 def test_qwen2_hf_keys_with_qkv_bias(fake_mesh):
     """Qwen2: Q/K/V bias should appear as separate keys, O has no bias."""
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -711,7 +666,6 @@ def test_qwen2_hf_keys_with_qkv_bias(fake_mesh):
 def test_qwen3_hf_keys_qk_norm(fake_mesh):
     """Qwen3: pre-norm + q_norm / k_norm HF keys."""
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -730,7 +684,6 @@ def test_qwen3_hf_keys_qk_norm(fake_mesh):
 def test_gemma2_hf_keys_sandwich(fake_mesh):
     """Gemma2: 4 sandwich norms, no q_norm / k_norm."""
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -752,7 +705,6 @@ def test_gemma2_hf_keys_sandwich(fake_mesh):
 def test_gemma3_hf_keys_sandwich_qk_norm(fake_mesh):
     """Gemma3: sandwich + q_norm / k_norm."""
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,
@@ -776,7 +728,6 @@ def test_gemma3_hf_keys_sandwich_qk_norm(fake_mesh):
 def test_siglip_hf_keys(fake_mesh):
     """SigLIP: layer_norm{1,2} + out_proj + fc1/fc2 + bias on q/k/v/o/fc/norm."""
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=96,
         num_heads=4,
@@ -819,7 +770,6 @@ def test_siglip_hf_keys(fake_mesh):
 
 def test_extra_repr_contains_key_fields(fake_mesh):
     fake_mesh()
-    _init_dispatcher()
     blk = TransformerBlock(
         hidden_size=64,
         num_heads=4,

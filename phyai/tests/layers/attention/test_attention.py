@@ -11,6 +11,8 @@ import.
 from __future__ import annotations
 
 import pytest
+
+from phyai.kernel.call import explain
 import torch
 
 from phyai.layers.attention import (
@@ -32,7 +34,7 @@ def _has_flashinfer() -> bool:
 
 
 def _can_use_flashinfer() -> bool:
-    return torch.cuda.is_available() and _has_flashinfer()
+    return _has_flashinfer()
 
 
 # --------------------------------------------------------------------- #
@@ -58,7 +60,7 @@ def test_construct_attention(backend: str):
 
 
 def test_attention_rejects_invalid_backend():
-    with pytest.raises(ValueError, match="not registered"):
+    with pytest.raises(ValueError, match="unknown backend"):
         Attention(num_heads=4, head_dim=16, backend="not-a-backend")
 
 
@@ -93,9 +95,9 @@ def test_padded_4d_convenience_path():
     builds a default backend + AttnCtx in-place."""
     torch.manual_seed(0)
     B, S, H, D = 2, 8, 4, 16
-    q = torch.randn(B, S, H, D)
-    k = torch.randn(B, S, H, D)
-    v = torch.randn(B, S, H, D)
+    q = torch.randn(B, S, H, D, device="cuda")
+    k = torch.randn(B, S, H, D, device="cuda")
+    v = torch.randn(B, S, H, D, device="cuda")
     attn = Attention(num_heads=H, head_dim=D, backend="eager", causal=True)
     out = attn(q, k, v)
     assert out.shape == (B, S, H, D)
@@ -106,9 +108,9 @@ def test_ragged_3d_convenience_path():
     H, D = 4, 16
     cu_q = torch.tensor([0, 5, 12], dtype=torch.int32)
     N = int(cu_q[-1])
-    q = torch.randn(N, H, D)
-    k = torch.randn(N, H, D)
-    v = torch.randn(N, H, D)
+    q = torch.randn(N, H, D, device="cuda")
+    k = torch.randn(N, H, D, device="cuda")
+    v = torch.randn(N, H, D, device="cuda")
     attn = Attention(num_heads=H, head_dim=D, backend="eager", causal=True)
     out = attn(q, k, v, cu_seqlens_q=cu_q)
     assert out.shape == (N, H, D)
@@ -117,7 +119,7 @@ def test_ragged_3d_convenience_path():
 def test_ragged_without_cu_seqlens_raises():
     """3-D q without cu_seqlens_q must raise (ctx=None convenience path)."""
     H, D = 2, 8
-    q = torch.randn(4, H, D)
+    q = torch.randn(4, H, D, device="cuda")
     attn = Attention(num_heads=H, head_dim=D, backend="eager", causal=True)
     with pytest.raises(ValueError, match="ragged forward requires cu_seqlens_q"):
         attn(q, q, q)
@@ -125,7 +127,7 @@ def test_ragged_without_cu_seqlens_raises():
 
 def test_invalid_q_rank_raises():
     H, D = 2, 4
-    q = torch.randn(2, 4, H, D, 1)  # 5-D
+    q = torch.randn(2, 4, H, D, 1, device="cuda")  # 5-D
     attn = Attention(num_heads=H, head_dim=D, backend="eager")
     with pytest.raises(ValueError, match="q must be 3-D .ragged. or 4-D"):
         attn(q, q, q)
@@ -139,9 +141,9 @@ def test_invalid_q_rank_raises():
 def test_eager_sdpa_padded_match_non_causal():
     torch.manual_seed(2)
     B, S, H, D = 2, 6, 4, 16
-    q = torch.randn(B, S, H, D)
-    k = torch.randn(B, S, H, D)
-    v = torch.randn(B, S, H, D)
+    q = torch.randn(B, S, H, D, device="cuda")
+    k = torch.randn(B, S, H, D, device="cuda")
+    v = torch.randn(B, S, H, D, device="cuda")
     eager = Attention(num_heads=H, head_dim=D, backend="eager", causal=False)
     sdpa = Attention(
         num_heads=H,
@@ -158,9 +160,9 @@ def test_eager_sdpa_padded_match_non_causal():
 def test_eager_sdpa_padded_match_causal():
     torch.manual_seed(3)
     B, S, H, D = 1, 8, 4, 16
-    q = torch.randn(B, S, H, D)
-    k = torch.randn(B, S, H, D)
-    v = torch.randn(B, S, H, D)
+    q = torch.randn(B, S, H, D, device="cuda")
+    k = torch.randn(B, S, H, D, device="cuda")
+    v = torch.randn(B, S, H, D, device="cuda")
     eager = Attention(num_heads=H, head_dim=D, backend="eager", causal=True)
     sdpa = Attention(
         num_heads=H,
@@ -177,9 +179,9 @@ def test_eager_sdpa_padded_match_causal():
 def test_eager_sdpa_padded_match_gqa():
     torch.manual_seed(4)
     B, S, H, H_kv, D = 1, 6, 4, 2, 16
-    q = torch.randn(B, S, H, D)
-    k = torch.randn(B, S, H_kv, D)
-    v = torch.randn(B, S, H_kv, D)
+    q = torch.randn(B, S, H, D, device="cuda")
+    k = torch.randn(B, S, H_kv, D, device="cuda")
+    v = torch.randn(B, S, H_kv, D, device="cuda")
     eager = Attention(
         num_heads=H,
         head_dim=D,
@@ -200,16 +202,21 @@ def test_eager_sdpa_padded_match_gqa():
     assert torch.allclose(out_e, out_s, atol=1e-5, rtol=1e-4)
 
 
-def test_sdpa_ragged_raises():
-    """SDPA is padded-only — ragged (3-D varlen) input must raise and point
-    to flashinfer. SDPA has no varlen API; varlen is flashinfer's job."""
+def test_sdpa_is_not_selected_for_ragged_input():
+    """SDPA is padded-only: it has no varlen API, so ragged is flashinfer's job.
+
+    That used to surface as ``NotImplementedError`` because the backend was
+    bound at construction. It is now a declared eligibility condition, so a
+    ragged call simply does not select SDPA — and the trace says exactly why.
+    The request still runs, on whichever implementation can handle it.
+    """
     torch.manual_seed(5)
     H, D = 4, 16
     cu_q = torch.tensor([0, 5, 12], dtype=torch.int32)
     N = int(cu_q[-1])
-    q = torch.randn(N, H, D)
-    k = torch.randn(N, H, D)
-    v = torch.randn(N, H, D)
+    q = torch.randn(N, H, D, device="cuda")
+    k = torch.randn(N, H, D, device="cuda")
+    v = torch.randn(N, H, D, device="cuda")
     sdpa = Attention(
         num_heads=H,
         head_dim=D,
@@ -217,8 +224,35 @@ def test_sdpa_ragged_raises():
         causal=False,
         backend_kwargs={"compile": False},
     )
-    with pytest.raises(NotImplementedError, match="flashinfer"):
-        sdpa(q, k, v, cu_seqlens_q=cu_q)
+
+    trace = explain(
+        "attention",
+        role=sdpa.kernel_role,
+        device=q.device,
+        dtype={"input": q.dtype, "key": k.dtype, "value": v.dtype},
+        shape={"head_dim": D, "tokens": N, "heads": H},
+        attrs={"layout": "ragged", "causal": False},
+        prefer=sdpa.prefer,
+    )
+    assert trace.selected != "sdpa.attention"
+    rejection = next(c for c in trace.candidates if c.kernel_id == "sdpa.attention")
+    assert "attrs.layout == padded" in rejection.reason
+
+    # The padded form of the same call does select SDPA.
+    padded = explain(
+        "attention",
+        role=sdpa.kernel_role,
+        device=q.device,
+        dtype={"input": q.dtype, "key": k.dtype, "value": v.dtype},
+        shape={"head_dim": D, "tokens": N, "heads": H},
+        attrs={"layout": "padded", "causal": False},
+        prefer=sdpa.prefer,
+    )
+    assert padded.selected == "sdpa.attention"
+
+    # And the ragged call still produces an answer.
+    out = sdpa(q, k, v, cu_seqlens_q=cu_q)
+    assert out.shape == (N, H, D)
 
 
 # --------------------------------------------------------------------- #
@@ -230,9 +264,9 @@ def test_sliding_window_zeros_above_window():
     """A window of 1 means each query attends only to its own position."""
     torch.manual_seed(6)
     B, S, H, D = 1, 6, 2, 8
-    q = torch.randn(B, S, H, D)
-    k = torch.randn(B, S, H, D)
-    v = torch.randn(B, S, H, D)
+    q = torch.randn(B, S, H, D, device="cuda")
+    k = torch.randn(B, S, H, D, device="cuda")
+    v = torch.randn(B, S, H, D, device="cuda")
     attn = Attention(
         num_heads=H,
         head_dim=D,
@@ -251,9 +285,9 @@ def test_logits_soft_cap_changes_output():
     """Soft-cap with finite cap must produce different output than no cap."""
     torch.manual_seed(7)
     B, S, H, D = 1, 4, 2, 8
-    q = torch.randn(B, S, H, D) * 5
-    k = torch.randn(B, S, H, D) * 5
-    v = torch.randn(B, S, H, D)
+    q = torch.randn(B, S, H, D, device="cuda") * 5
+    k = torch.randn(B, S, H, D, device="cuda") * 5
+    v = torch.randn(B, S, H, D, device="cuda")
     no_cap = Attention(
         num_heads=H,
         head_dim=D,
@@ -280,9 +314,9 @@ def test_logits_soft_cap_changes_output():
 def test_explicit_ctx_padded_idle_returns_zeros():
     """IDLE mode bypasses the kernel and returns zeros."""
     B, S, H, D = 2, 4, 2, 8
-    q = torch.randn(B, S, H, D)
-    k = torch.randn(B, S, H, D)
-    v = torch.randn(B, S, H, D)
+    q = torch.randn(B, S, H, D, device="cuda")
+    k = torch.randn(B, S, H, D, device="cuda")
+    v = torch.randn(B, S, H, D, device="cuda")
     attn = Attention(num_heads=H, head_dim=D, backend="eager")
     backend = attn._ensure_backend()
     plan = backend.init_forward_metadata(
@@ -335,9 +369,9 @@ def test_eager_sdpa_padded_match_rectangular():
     """4-D padded with S_q != S_kv (cross-attention) — eager vs sdpa, B>1 + GQA."""
     torch.manual_seed(10)
     B, S_q, S_kv, H, H_kv, D = 2, 5, 9, 4, 2, 16
-    q = torch.randn(B, S_q, H, D)
-    k = torch.randn(B, S_kv, H_kv, D)
-    v = torch.randn(B, S_kv, H_kv, D)
+    q = torch.randn(B, S_q, H, D, device="cuda")
+    k = torch.randn(B, S_kv, H_kv, D, device="cuda")
+    v = torch.randn(B, S_kv, H_kv, D, device="cuda")
     eager = Attention(
         num_heads=H, head_dim=D, num_kv_heads=H_kv, backend="eager", causal=False
     )
@@ -355,34 +389,21 @@ def test_eager_sdpa_padded_match_rectangular():
     assert torch.allclose(out_e, out_s, atol=1e-5, rtol=1e-4)
 
 
-@pytest.mark.parametrize(
-    "device",
-    [
-        "cpu",
-        pytest.param(
-            "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="needs CUDA"
-            ),
-        ),
-    ],
-)
-def test_sdpa_select_kernel_matches_default(device: str):
+def test_sdpa_select_kernel_matches_default():
     """The CUDA kernel-priority context must not perturb results.
 
-    ``select_kernel`` only biases which fused kernel CUDA dispatches to; it is
-    a no-op on CPU. Same inputs through ``select_kernel=True`` and ``False``
-    must agree. On CPU the context is a no-op (trivially exact); the ``cuda``
-    parametrization is the real guard — it enters the ``sdpa_kernel`` priority
-    context and checks the chosen kernel still matches default dispatch.
+    ``select_kernel`` only biases which fused kernel CUDA dispatches to.
+    Same inputs through ``select_kernel=True`` and ``False`` must agree:
+    the test enters the ``sdpa_kernel`` priority context and checks the
+    chosen kernel still matches default dispatch.
     """
     torch.manual_seed(13)
     # head_dim=64 + fp16 on CUDA exercises a real fused kernel; CPU uses fp32.
     B, S, H, H_kv, D = 2, 8, 4, 2, 64
-    dtype = torch.float16 if device == "cuda" else torch.float32
-    q = torch.randn(B, S, H, D, device=device, dtype=dtype)
-    k = torch.randn(B, S, H_kv, D, device=device, dtype=dtype)
-    v = torch.randn(B, S, H_kv, D, device=device, dtype=dtype)
+    dtype = torch.float16
+    q = torch.randn(B, S, H, D, device="cuda", dtype=dtype)
+    k = torch.randn(B, S, H_kv, D, device="cuda", dtype=dtype)
+    v = torch.randn(B, S, H_kv, D, device="cuda", dtype=dtype)
     sel = Attention(
         num_heads=H,
         head_dim=D,
@@ -414,9 +435,9 @@ def test_padded_rectangular_matches_ragged():
     """
     torch.manual_seed(11)
     B, S_q, S_kv, H, D = 2, 4, 7, 4, 16
-    q = torch.randn(B, S_q, H, D)
-    k = torch.randn(B, S_kv, H, D)
-    v = torch.randn(B, S_kv, H, D)
+    q = torch.randn(B, S_q, H, D, device="cuda")
+    k = torch.randn(B, S_kv, H, D, device="cuda")
+    v = torch.randn(B, S_kv, H, D, device="cuda")
     attn = Attention(num_heads=H, head_dim=D, backend="eager", causal=False)
     out_padded = attn(q, k, v)
     cu_q = torch.arange(0, (B + 1) * S_q, S_q, dtype=torch.int32)

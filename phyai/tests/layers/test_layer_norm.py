@@ -8,16 +8,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import phyai.layers.linear as L
-from phyai.layers.layer_norm import AdaRMSNorm, LayerNorm
+from phyai.layers.layer_norm import AdaRMSNorm, GatedRMSNorm, LayerNorm, RMSNorm
 from phyai.parallel.mesh import Mesh
 from phyai.parallel.state import _meshes, register_mesh
-
-
-cuda_only = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="phyai LayerNorm backends are CUDA-only",
-)
 
 
 # --------------------------------------------------------------------------- #
@@ -26,7 +19,9 @@ cuda_only = pytest.mark.skipif(
 
 
 def test_unknown_backend_raises():
-    with pytest.raises(ValueError, match="Unknown norm backend"):
+    # The message now comes from the shared catalog validator, which also
+    # lists what this build offers.
+    with pytest.raises(ValueError, match="unknown backend"):
         LayerNorm(64, backend="banana")
 
 
@@ -78,8 +73,8 @@ def test_attach_load_weight_and_bias():
     src_b = torch.randn(D)
     m.weight.weight_loader(m.weight, src_w, None)
     m.bias.weight_loader(m.bias, src_b, None)
-    torch.testing.assert_close(m.weight.data, src_w)
-    torch.testing.assert_close(m.bias.data, src_b)
+    torch.testing.assert_close(m.weight.data.cpu(), src_w)
+    torch.testing.assert_close(m.bias.data.cpu(), src_b)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,7 +88,6 @@ def _ref_layer_norm(
     return F.layer_norm(x, (x.shape[-1],), weight=weight, bias=bias, eps=eps)
 
 
-@cuda_only
 @pytest.mark.parametrize("backend", ["flashinfer", "phyai-kernel"])
 @pytest.mark.parametrize("with_bias", [True, False])
 def test_forward_matches_torch_reference_bf16(backend, with_bias):
@@ -117,7 +111,6 @@ def test_forward_matches_torch_reference_bf16(backend, with_bias):
     torch.testing.assert_close(y, ref, atol=2e-2, rtol=2e-2)
 
 
-@cuda_only
 def test_flashinfer_matches_phyai_kernel():
     """Both backends must produce numerically equivalent output."""
     torch.manual_seed(1)
@@ -138,7 +131,6 @@ def test_flashinfer_matches_phyai_kernel():
     torch.testing.assert_close(y_fi, y_pk, atol=2e-2, rtol=2e-2)
 
 
-@cuda_only
 def test_phyai_kernel_higher_rank_input():
     """4-D input flattens to (N, D) and reshapes back."""
     torch.manual_seed(2)
@@ -151,7 +143,34 @@ def test_phyai_kernel_higher_rank_input():
     torch.testing.assert_close(y, ref, atol=2e-2, rtol=2e-2)
 
 
-@cuda_only
+@pytest.mark.parametrize("backend", ["flashinfer", "phyai-kernel"])
+def test_rmsnorm_fused_residual_higher_rank_input(backend):
+    """The fused-residual path accepts padded (B, S, D) inputs.
+
+    Fused kernels operate on (tokens, hidden); the layer must flatten and
+    restore the batch shape, exactly like the plain path already does. The
+    reference is the fused torch semantics: residual += x, then rmsnorm.
+    """
+    torch.manual_seed(5)
+    B, S, D = 2, 6, 256
+    m = RMSNorm(D, backend=backend, dtype=torch.bfloat16).cuda()
+    src_w = (torch.randn(D) * 0.05 + 1.0).to(torch.bfloat16).cuda()
+    m.weight.data.copy_(src_w)
+
+    x = (torch.randn(B, S, D) * 0.4).to(torch.bfloat16).cuda()
+    residual = (torch.randn(B, S, D) * 0.4).to(torch.bfloat16).cuda()
+    summed = (residual.float() + x.float()).to(torch.bfloat16)
+    ref = torch.nn.functional.rms_norm(
+        summed.float(), (D,), weight=src_w.float(), eps=m.variance_epsilon
+    ).to(torch.bfloat16)
+
+    out, new_residual = m(x, residual)
+    assert out.shape == (B, S, D)
+    assert new_residual.shape == (B, S, D)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(new_residual, summed, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("backend", ["flashinfer", "phyai-kernel"])
 def test_no_bias_path_matches_reference(backend):
     """``bias=False`` must give identical output to F.layer_norm(..., bias=None)."""
@@ -167,7 +186,6 @@ def test_no_bias_path_matches_reference(backend):
     torch.testing.assert_close(y, ref, atol=2e-2, rtol=2e-2)
 
 
-@cuda_only
 def test_phyai_kernel_fp32_path():
     """fp32 path on phyai-kernel: tighter tolerance."""
     torch.manual_seed(4)
@@ -196,13 +214,11 @@ def test_phyai_kernel_fp32_path():
 
 @pytest.fixture
 def _adarms_linear_env():
-    """Bootstrap the linear dispatcher + a degenerate ``"model"`` mesh.
+    """Register the degenerate ``"model"`` mesh used by AdaRMSNorm.
 
-    ``AdaRMSNorm.dense`` is a :class:`ReplicatedLinear`, whose ``__init__``
-    consults the linear-dispatcher singleton and the ``"model"`` mesh — so
-    they must exist before construction (same setup as
-    ``phyai-kernel/tests/conftest.py``). ``LayerNorm`` has no such linear, so
-    this is scoped to the AdaRMSNorm tests rather than module-autouse.
+    ``AdaRMSNorm.dense`` is a :class:`ReplicatedLinear`, whose constructor
+    resolves this mesh. ``LayerNorm`` has no linear submodule, so the fixture is
+    scoped to the AdaRMSNorm tests rather than enabled for the whole module.
     """
     saved = dict(_meshes)
     tm = MagicMock()
@@ -211,23 +227,20 @@ def _adarms_linear_env():
     tm.get_local_rank.side_effect = lambda axis=None: 0
     tm.get_group.side_effect = lambda axis: MagicMock(name=f"pg-{axis}")
     register_mesh(Mesh(tm, name="model"))
-    L.init(register_flashinfer=False, validate=False)
     try:
         yield
     finally:
         _meshes.clear()
         _meshes.update(saved)
-        L._reset_for_test()
 
 
-def _make_cpu_adarms(hidden: int, cond_dim: int) -> AdaRMSNorm:
+def _make_adarms(hidden: int, cond_dim: int) -> AdaRMSNorm:
     m = AdaRMSNorm(
         hidden_size=hidden,
         cond_dim=cond_dim,
         eps=1e-6,
-        backend="torch",
         dtype=torch.float32,
-        device="cpu",
+        device="cuda",
     )
     with torch.no_grad():
         m.dense.weight.normal_(0.0, 0.05)
@@ -239,8 +252,8 @@ def test_adarmsnorm_project_modulation_is_pure_and_shaped(_adarms_linear_env):
     """``project_modulation`` returns a ``(K, 3*D)`` table and stores nothing."""
     torch.manual_seed(0)
     hidden, cond_dim, k = 64, 48, 5
-    m = _make_cpu_adarms(hidden, cond_dim)
-    conds = torch.randn(k, cond_dim)
+    m = _make_adarms(hidden, cond_dim)
+    conds = torch.randn(k, cond_dim, device="cuda")
     mod = m.project_modulation(conds)
     assert mod.shape == (k, 3 * hidden)
     # Pure: no cache attribute left on the module.
@@ -250,18 +263,18 @@ def test_adarmsnorm_project_modulation_is_pure_and_shaped(_adarms_linear_env):
     torch.testing.assert_close(mod, ref, atol=1e-6, rtol=1e-6)
 
 
-def test_adarmsnorm_modulation_matches_cond_path_cpu(_adarms_linear_env):
+def test_adarmsnorm_modulation_matches_cond_path(_adarms_linear_env):
     """``forward(x, modulation=row)`` equals ``forward(x, cond_row)`` broadcast."""
     torch.manual_seed(1)
     hidden = cond_dim = 128
     chunk, k = 20, 6
-    m = _make_cpu_adarms(hidden, cond_dim)
+    m = _make_adarms(hidden, cond_dim)
 
-    conds = torch.randn(k, cond_dim)
+    conds = torch.randn(k, cond_dim, device="cuda")
     mod = m.project_modulation(conds)
 
     for i in (0, 2, k - 1):
-        x = torch.randn(chunk, hidden)
+        x = torch.randn(chunk, hidden, device="cuda")
         out_mod, gate_mod = m(x, modulation=mod[i : i + 1])
         out_ref, gate_ref = m(x, conds[i : i + 1].expand(chunk, -1))
         torch.testing.assert_close(out_mod, out_ref, atol=1e-5, rtol=1e-5)
@@ -271,15 +284,45 @@ def test_adarmsnorm_modulation_matches_cond_path_cpu(_adarms_linear_env):
         )
 
 
-def test_adarmsnorm_requires_exactly_one_of_cond_or_modulation_cpu(_adarms_linear_env):
+def test_adarmsnorm_requires_exactly_one_of_cond_or_modulation(_adarms_linear_env):
     torch.manual_seed(2)
     hidden = cond_dim = 32
-    m = _make_cpu_adarms(hidden, cond_dim)
-    x = torch.randn(4, hidden)
+    m = _make_adarms(hidden, cond_dim)
+    x = torch.randn(4, hidden, device="cuda")
 
     with pytest.raises(ValueError, match="exactly one"):
         m(x)  # neither
-    cond = torch.randn(4, cond_dim)
+    cond = torch.randn(4, cond_dim, device="cuda")
     mod = m.project_modulation(cond)
     with pytest.raises(ValueError, match="exactly one"):
         m(x, cond, modulation=mod[:1])  # both
+
+
+# --------------------------------------------------------------------------- #
+# GatedRMSNorm
+# --------------------------------------------------------------------------- #
+
+
+def test_gated_rmsnorm_matches_the_reference_math() -> None:
+    """``rmsnorm(x) * silu(gate)``, reductions and the gate in fp32."""
+
+    torch.manual_seed(3)
+    layer = GatedRMSNorm(64, eps=1e-6, device="cuda")
+    with torch.no_grad():
+        layer.weight.normal_(1.0, 0.1)
+    x = torch.randn(8, 64, device="cuda")
+    gate = torch.randn(8, 64, device="cuda")
+
+    out = layer(x, gate)
+
+    promoted = x.float()
+    normed = promoted * torch.rsqrt(promoted.square().mean(-1, keepdim=True) + 1e-6)
+    ref = (normed * layer.weight.float()) * F.silu(gate.float())
+    torch.testing.assert_close(out, ref.to(x.dtype))
+
+
+def test_gated_rmsnorm_weight_defaults_to_fp32_ones() -> None:
+    layer = GatedRMSNorm(16, device="cpu", prefix="model.layers.0.norm")
+    assert layer.weight.dtype == torch.float32
+    assert torch.all(layer.weight == 1.0)
+    assert layer.weight.hf_keys == [("model.layers.0.norm.weight", None)]

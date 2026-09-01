@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -31,11 +30,11 @@ from phyai.models.cosmos3.scheduler_ws1_cosmos3 import (
     Cosmos3T2VScheduler,
 )
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
-from phyai.utils import load_config, this_rank_log
+from phyai.utils import get_logger, load_config
 from phyai.weights import load_pretrained
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -97,9 +96,8 @@ class Cosmos3Entry(Entry):
             else load_config(ckpt / "transformer", Cosmos3Config)
         )
 
-        # The engine already ran P.init (mesh) + L.init (linear dispatcher) before
-        # setup(), so the model constructors below find the dispatcher ready — no
-        # register_mesh shim like the standalone example scripts need.
+        # The engine already initialized the mesh and process kernel selector, so
+        # the model constructors below need no standalone register_mesh shim.
         with use_quant_plan(load_quant_plan(ckpt / "transformer")):
             self.transformer = Cosmos3Transformer(
                 config, params_dtype=dtype, device=device
@@ -144,9 +142,7 @@ class Cosmos3Entry(Entry):
             compile_kwargs=args.compile_kwargs,
         )
         self.scheduler.setup()
-        this_rank_log(
-            logger,
-            logging.INFO,
+        logger.info_rank0(
             "Cosmos3 generation plugin ready (sound=%s, flow_shift=%s, "
             "use_karras_sigmas=%s).",
             self.avae is not None,

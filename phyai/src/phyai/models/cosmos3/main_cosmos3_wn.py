@@ -5,17 +5,16 @@ tensor-parallel ("wn") path. Identical build (transformer + VAE [+ AVAE], weight
 load, scheduler warmup) except it constructs the tensor-parallel
 :class:`~phyai.models.cosmos3.scheduler_wn_cosmos3.Cosmos3T2VWNScheduler`.
 
-The engine bootstrap (``init_dist`` -> ``P.init`` 5-axis mesh -> ``L.init``) runs
-before :meth:`setup`, so the model constructors find the TP mesh ready and the
-parallel layers shard themselves on load. Drive TP via ``ParallelConfig(world_size=N,
-tp_size=N)`` and launch one process per rank under ``torchrun`` (see
-``examples/cosmos3/run_cosmos3_wn.py``). Every rank runs the identical denoise loop;
-only rank 0 should persist the returned media.
+The engine bootstrap initializes distributed state, the five-axis mesh, and the
+kernel selector before :meth:`setup`, so the model constructors find the TP mesh
+ready and the parallel layers shard themselves on load. Drive TP via
+``ParallelConfig(world_size=N, tp_size=N)`` and launch one process per rank under
+``torchrun`` (see ``examples/cosmos3/run_cosmos3_wn.py``). Every rank runs the
+identical denoise loop; only rank 0 should persist the returned media.
 """
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -43,11 +42,11 @@ from phyai.models.cosmos3.sampler_unipc import resolve_use_karras_sigmas
 from phyai.models.cosmos3.scheduler_ws1_cosmos3 import Cosmos3T2VRequest
 from phyai.models.cosmos3.scheduler_wn_cosmos3 import Cosmos3T2VWNScheduler
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
-from phyai.utils import load_config, this_rank_log
+from phyai.utils import get_logger, load_config
 from phyai.weights import load_pretrained
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -139,9 +138,7 @@ class Cosmos3WNEntry(Entry):
             compile_kwargs=args.compile_kwargs,
         )
         self.scheduler.setup()
-        this_rank_log(
-            logger,
-            logging.INFO,
+        logger.info_rank0(
             "Cosmos3 tensor-parallel generation plugin ready (tp=%d, sound=%s, "
             "flow_shift=%s, use_karras_sigmas=%s).",
             self.scheduler.tp_size,
