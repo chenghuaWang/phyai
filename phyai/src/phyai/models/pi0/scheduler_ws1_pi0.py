@@ -18,10 +18,14 @@ import torch
 
 from phyai.cache import KVCachePool, StaticCache
 from phyai.layers.attention import (
-    ARAttnMetadata,
     AttnLayout,
     AttnMode,
-    DiffusionAttnMetadata,
+    PagedAttnMetadata,
+)
+from phyai.layers.attention.paged.indices import (
+    padded_write_indices,
+    suffix_pos_ids,
+    visibility_indices,
 )
 from phyai.models.pi0.configuration_pi0 import PI0Config
 from phyai.models.pi0.model_runner_pi0 import (
@@ -59,107 +63,6 @@ def pack_prefix_per_sample_padded(
         if L_lang > 0:
             packed[base + n_img : base + n_img + L_lang] = lang_embs[b, :L_lang]
     return packed
-
-
-def build_prefix_padded_write_indices(
-    real_lens: torch.Tensor,
-    *,
-    n_per_sample: int,
-    prefix_slot_base: int,
-    sentinel_slot: int = 0,
-) -> torch.Tensor:
-    """KV-pool slot index per padded prefix token."""
-
-    device = real_lens.device
-    B = int(real_lens.shape[0])
-    real64 = real_lens.to(torch.int64)
-    cu_real = torch.zeros(B + 1, dtype=torch.int64, device=device)
-    cu_real[1:] = torch.cumsum(real64, 0)
-
-    j = torch.arange(n_per_sample, dtype=torch.int64, device=device).unsqueeze(0)
-    real_at_b = real64.unsqueeze(1)
-    cu_at_b = cu_real[:-1].unsqueeze(1)
-    is_real = j < real_at_b
-    real_slot = prefix_slot_base + cu_at_b + j
-    write = torch.where(
-        is_real, real_slot, torch.full_like(real_slot, int(sentinel_slot))
-    )
-    return write.flatten().to(torch.int64)
-
-
-def build_state_pos_ids(real_lens: torch.Tensor) -> torch.Tensor:
-    """RoPE positions for pi0 state tokens, ``(B,)`` int32."""
-
-    return real_lens.to(torch.int32)
-
-
-def build_action_pos_ids(real_lens: torch.Tensor, chunk_size: int) -> torch.Tensor:
-    """RoPE positions for pi0 action tokens, ``(B * chunk_size,)`` int32."""
-
-    device = real_lens.device
-    base = real_lens.to(torch.int64).unsqueeze(1) + 1
-    j = torch.arange(chunk_size, dtype=torch.int64, device=device).unsqueeze(0)
-    return (base + j).flatten().to(torch.int32)
-
-
-def build_pi0_state_paged_kv_indices(
-    real_lens: torch.Tensor,
-    suffix_len: int,
-    *,
-    prefix_slot_base: int,
-    suffix_slot_base: int,
-) -> torch.Tensor:
-    """Per-sample KV slots visible to the state query: prefix + state."""
-
-    device = real_lens.device
-    B = int(real_lens.shape[0])
-    real64 = real_lens.to(torch.int64)
-    cu_p = torch.zeros(B + 1, dtype=torch.int64, device=device)
-    cu_p[1:] = torch.cumsum(real64, 0)
-
-    total_lens = real64 + 1
-    cu_full = torch.zeros(B + 1, dtype=torch.int64, device=device)
-    cu_full[1:] = torch.cumsum(total_lens, 0)
-    n_full = int(cu_full[-1])
-
-    arange_full = torch.arange(n_full, dtype=torch.int64, device=device)
-    seg_id = torch.searchsorted(cu_full[1:], arange_full, right=True)
-    pos_within = arange_full - cu_full[seg_id]
-    real_at_seg = real64[seg_id]
-    is_prefix = pos_within < real_at_seg
-    prefix_slot = prefix_slot_base + cu_p[seg_id] + pos_within
-    state_slot = suffix_slot_base + seg_id * suffix_len
-    return torch.where(is_prefix, prefix_slot, state_slot).to(torch.int32)
-
-
-def build_pi0_action_paged_kv_indices(
-    real_lens: torch.Tensor,
-    suffix_len: int,
-    *,
-    prefix_slot_base: int,
-    suffix_slot_base: int,
-) -> torch.Tensor:
-    """Per-sample KV slots visible to action queries: prefix + state + action."""
-
-    device = real_lens.device
-    B = int(real_lens.shape[0])
-    real64 = real_lens.to(torch.int64)
-    cu_p = torch.zeros(B + 1, dtype=torch.int64, device=device)
-    cu_p[1:] = torch.cumsum(real64, 0)
-
-    total_lens = real64 + suffix_len
-    cu_full = torch.zeros(B + 1, dtype=torch.int64, device=device)
-    cu_full[1:] = torch.cumsum(total_lens, 0)
-    n_full = int(cu_full[-1])
-
-    arange_full = torch.arange(n_full, dtype=torch.int64, device=device)
-    seg_id = torch.searchsorted(cu_full[1:], arange_full, right=True)
-    pos_within = arange_full - cu_full[seg_id]
-    real_at_seg = real64[seg_id]
-    is_prefix = pos_within < real_at_seg
-    prefix_slot = prefix_slot_base + cu_p[seg_id] + pos_within
-    suffix_slot = suffix_slot_base + seg_id * suffix_len + (pos_within - real_at_seg)
-    return torch.where(is_prefix, prefix_slot, suffix_slot).to(torch.int32)
 
 
 @dataclass
@@ -390,16 +293,16 @@ class PI0WS1Scheduler(Scheduler):
                 device=device,
             )
             paged_kv_last_prefix = (real_lens > 0).to(torch.int32)
-            write_indices = build_prefix_padded_write_indices(
+            write_indices = padded_write_indices(
                 real_lens,
                 n_per_sample=self.n_per_sample,
-                prefix_slot_base=self.prefix_base,
+                slot_base=self.prefix_base,
                 sentinel_slot=self.sentinel_slot,
             )
             position_ids = torch.arange(
                 self.n_per_sample, dtype=torch.int32, device=device
             ).repeat(max_B)
-            prefix_meta = ARAttnMetadata(
+            prefix_meta = PagedAttnMetadata(
                 mode=AttnMode.PREFILL,
                 layout=AttnLayout.RAGGED_3D,
                 batch_size=max_B,
@@ -432,13 +335,16 @@ class PI0WS1Scheduler(Scheduler):
             )
             state_indptr = torch.zeros(max_B + 1, dtype=torch.int32, device=device)
             state_indptr[1:] = torch.cumsum(real_lens + 1, 0)
-            state_indices = build_pi0_state_paged_kv_indices(
+            # The state pass sees each sample's real prefix plus the state
+            # token alone — the first row of the suffix block.
+            state_indices = visibility_indices(
                 real_lens,
-                self.suffix_len,
                 prefix_slot_base=self.prefix_base,
                 suffix_slot_base=self.suffix_base,
+                suffix_stride=self.suffix_len,
+                suffix_visible=1,
             )
-            state_meta = DiffusionAttnMetadata(
+            state_meta = PagedAttnMetadata(
                 mode=AttnMode.PREFILL,
                 layout=AttnLayout.RAGGED_3D,
                 batch_size=max_B,
@@ -449,7 +355,7 @@ class PI0WS1Scheduler(Scheduler):
                 paged_kv_last_page_len=torch.ones(
                     max_B, dtype=torch.int32, device=device
                 ),
-                position_ids=build_state_pos_ids(real_lens),
+                position_ids=suffix_pos_ids(real_lens, 1),
             )
 
             cu_q_action = torch.arange(
@@ -461,13 +367,16 @@ class PI0WS1Scheduler(Scheduler):
             )
             action_indptr = torch.zeros(max_B + 1, dtype=torch.int32, device=device)
             action_indptr[1:] = torch.cumsum(real_lens + self.suffix_len, 0)
-            action_indices = build_pi0_action_paged_kv_indices(
+            # The action pass sees everything: prefix, state, and the whole
+            # action chunk (visibility == the full suffix stride).
+            action_indices = visibility_indices(
                 real_lens,
-                self.suffix_len,
                 prefix_slot_base=self.prefix_base,
                 suffix_slot_base=self.suffix_base,
+                suffix_stride=self.suffix_len,
+                suffix_visible=self.suffix_len,
             )
-            action_meta = DiffusionAttnMetadata(
+            action_meta = PagedAttnMetadata(
                 mode=AttnMode.PREFILL,
                 layout=AttnLayout.RAGGED_3D,
                 batch_size=max_B,
@@ -478,7 +387,7 @@ class PI0WS1Scheduler(Scheduler):
                 paged_kv_last_page_len=torch.ones(
                     max_B, dtype=torch.int32, device=device
                 ),
-                position_ids=build_action_pos_ids(real_lens, cfg.chunk_size),
+                position_ids=suffix_pos_ids(real_lens, cfg.chunk_size, offset=1),
             )
             self.expert_runner.plan_inference(state_meta, action_meta)
 
@@ -581,10 +490,5 @@ class PI0WS1Scheduler(Scheduler):
 __all__ = [
     "PI0Request",
     "PI0WS1Scheduler",
-    "build_action_pos_ids",
-    "build_pi0_action_paged_kv_indices",
-    "build_pi0_state_paged_kv_indices",
-    "build_prefix_padded_write_indices",
-    "build_state_pos_ids",
     "pack_prefix_per_sample_padded",
 ]

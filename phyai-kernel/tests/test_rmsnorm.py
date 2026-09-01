@@ -25,11 +25,6 @@ import torch
 import phyai_kernel
 import phyai_kernel.triton.rms_norm as triton_rmsnorm_mod
 
-if not torch.cuda.is_available():
-    pytest.skip(
-        "CUDA is required for phyai-kernel Triton tests", allow_module_level=True
-    )
-
 
 # --------------------------------------------------------------------------- #
 # Reference implementations (semantics match SGLang's test_norm.py)          #

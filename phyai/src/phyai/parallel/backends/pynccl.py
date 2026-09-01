@@ -20,14 +20,13 @@ Two practical reasons:
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
-from phyai.parallel.backend import Backend, Op, Topology
+from phyai.parallel.backend import Op, Topology
 from phyai.parallel.state import Mode
 from phyai.parallel.backends.pynccl_wrapper import (
     NCCLLibrary,
@@ -38,12 +37,12 @@ from phyai.parallel.backends.pynccl_wrapper import (
     ncclRedOpTypeEnum,
     ncclUniqueId,
 )
-from phyai.utils import all_ranks_log
+from phyai.utils import get_logger
 
 if TYPE_CHECKING:
     from phyai.parallel.mesh import Mesh
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class _PyNcclComm:
@@ -196,7 +195,7 @@ class _PyNcclComm:
             try:
                 self.nccl.ncclCommDestroy(self.comm)
             except Exception as e:
-                all_ranks_log(logger, logging.WARNING, "ncclCommDestroy failed: %s", e)
+                logger.warning("ncclCommDestroy failed: %s", e)
             self.comm = None
 
 

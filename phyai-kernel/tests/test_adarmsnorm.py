@@ -28,11 +28,6 @@ import torch
 import phyai_kernel
 import phyai_kernel.triton.ada_rms_norm as triton_adarms_mod
 
-if not torch.cuda.is_available():
-    pytest.skip(
-        "CUDA is required for phyai-kernel Triton tests", allow_module_level=True
-    )
-
 
 # --------------------------------------------------------------------------- #
 # Reference (mirrors lerobot ``PiGemmaRMSNorm.forward`` exactly)              #

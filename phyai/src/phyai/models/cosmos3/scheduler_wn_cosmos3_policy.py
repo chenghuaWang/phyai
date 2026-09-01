@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 
 import numpy as np
 import torch
@@ -18,11 +17,11 @@ from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import (
 )
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE
 from phyai.runtime.schedule import Scheduler
-from phyai.utils import this_rank_log
+from phyai.utils import get_logger
 from phyai.utils.profile import event_scope
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _tp_rank_size() -> tuple[int, int]:
@@ -93,9 +92,7 @@ class Cosmos3PolicyWNScheduler(Scheduler):
         if self.vae_runner is not None:
             self.vae_runner.setup()
         self._ready = True
-        this_rank_log(
-            logger,
-            logging.INFO,
+        logger.info_rank0(
             "Cosmos3 policy scheduler ready (UniPC, tp=%d, cfg=%d).",
             self.tp_size,
             self.cfg_size,
@@ -206,9 +203,7 @@ class Cosmos3PolicyWNScheduler(Scheduler):
         # otherwise the sequential cond+uncond loop below runs unchanged.
         if self.cfg_size > 1:
             if not do_cfg:
-                this_rank_log(
-                    logger,
-                    logging.WARNING,
+                logger.warning_rank0(
                     "cfg_size=%d but guidance_scale=%.3f<=1 (CFG off): the uncond "
                     "branch is redundant — run with cfg_size=1 to save the GPUs.",
                     self.cfg_size,

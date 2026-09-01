@@ -13,7 +13,6 @@ Override the library path with ``PHYAI_NCCL_SO_PATH`` if needed.
 from __future__ import annotations
 
 import ctypes
-import logging
 import os
 import platform
 from dataclasses import dataclass
@@ -22,15 +21,15 @@ from typing import Any
 import torch
 from torch.distributed import ReduceOp
 
-from phyai.utils import all_ranks_log, this_rank_log
+from phyai.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def find_nccl_library() -> str:
     so_file = os.environ.get("PHYAI_NCCL_SO_PATH")
     if so_file:
-        this_rank_log(logger, logging.INFO, "Using PHYAI_NCCL_SO_PATH=%s", so_file)
+        logger.info_rank0("Using PHYAI_NCCL_SO_PATH=%s", so_file)
         return so_file
     if torch.version.cuda is not None:
         return "libnccl.so.2"
@@ -230,11 +229,9 @@ class NCCLLibrary:
                 NCCLLibrary._path_lib_cache[so_file] = ctypes.CDLL(so_file)
             self.lib = NCCLLibrary._path_lib_cache[so_file]
         except Exception as e:
-            all_ranks_log(
-                logger,
-                logging.ERROR,
-                "Failed to load NCCL library from %s on platform %s. "
-                "Set PHYAI_NCCL_SO_PATH to point to a valid libnccl.",
+            logger.error(
+                "Failed to load NCCL library from %s on platform %s. Set "
+                "PHYAI_NCCL_SO_PATH to point to a valid libnccl.",
                 so_file,
                 platform.platform(),
             )

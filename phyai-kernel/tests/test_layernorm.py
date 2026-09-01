@@ -14,12 +14,6 @@ import phyai_kernel
 import phyai_kernel.triton.layer_norm as triton_ln_mod
 
 
-if not torch.cuda.is_available():
-    pytest.skip(
-        "CUDA is required for phyai-kernel Triton tests", allow_module_level=True
-    )
-
-
 # --------------------------------------------------------------------------- #
 # Reference                                                                    #
 # --------------------------------------------------------------------------- #

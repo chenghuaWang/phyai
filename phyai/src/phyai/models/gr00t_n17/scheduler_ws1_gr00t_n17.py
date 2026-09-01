@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-import logging
 
 import torch
 
@@ -22,10 +21,10 @@ from phyai.models.gr00t_n17.modeling_gr00t_n17 import (
     GR00TN17Model,
 )
 from phyai.runtime.schedule import Scheduler
-from phyai.utils import this_rank_log
+from phyai.utils import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -89,11 +88,9 @@ class GR00TN17WS1Scheduler(Scheduler):
             self.backbone_runner.use_cuda_graph
             != self.action_head_runner.use_cuda_graph
         ):
-            this_rank_log(
-                logger,
-                logging.WARNING,
+            logger.warning_rank0(
                 "GR00T-N1.7 CUDA Graphs require both Backbone and Action Head "
-                "runners to support capture; disabling CUDA Graphs for both.",
+                "runners to support capture; disabling CUDA Graphs for both."
             )
         self.backbone_runner.use_cuda_graph = self.use_cuda_graph
         self.action_head_runner.use_cuda_graph = self.use_cuda_graph
@@ -185,11 +182,9 @@ class GR00TN17WS1Scheduler(Scheduler):
             seen_keys.add(key)
             unique_requests.append((index, request))
         if len(unique_requests) != len(capture_requests):
-            this_rank_log(
-                logger,
-                logging.INFO,
-                "Deduplicated %d GR00T-N1.7 capture profiles to %d unique "
-                "Graph structures.",
+            logger.info_rank0(
+                "Deduplicated %d GR00T-N1.7 capture profiles to %d unique Graph "
+                "structures.",
                 len(capture_requests),
                 len(unique_requests),
             )

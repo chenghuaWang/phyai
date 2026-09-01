@@ -13,20 +13,32 @@ When ``world_size == 1`` and no caller-owned process group exists, no
 :mod:`phyai.parallel.ops` short-circuits at world_size=1, so a real
 group would be ceremony. The function returns ``False`` (we don't own
 a process group) and the caller skips the matching teardown.
+
+Device before group
+-------------------
+``torch.cuda.set_device`` runs *before* ``init_process_group``, not
+after. NCCL binds to the current device as it builds its communicator,
+and anything allocated between the two calls lands on whatever device
+was current — so a late ``set_device`` means the group and the tensors
+can disagree about which GPU this rank owns.
 """
 
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+
+from phyai.utils.cuda import resolve_device
 
 
 def init_dist(
     *,
     world_size: int,
     device_type: str,
+    timeout: timedelta | None = None,
 ) -> bool:
     """Bring up the process group for the requested ``world_size``.
 
@@ -34,6 +46,14 @@ def init_dist(
     product of every parallel axis (``dp * ep * sp * cp * tp``), not
     one specific axis. The caller (typically :class:`~phyai.engine.Engine`)
     has already done the multiplication.
+
+    Args:
+        world_size: total rank count for the global mesh.
+        device_type: ``"cuda"`` / ``"cpu"``; picks the backend and decides
+            whether a device gets pinned.
+        timeout: collective timeout handed to ``init_process_group``.
+            ``None`` keeps torch's own default. Engine passes
+            :attr:`~phyai.engine_config.RuntimeConfig.dist_timeout_s`.
 
     Returns
     -------
@@ -54,7 +74,7 @@ def init_dist(
     if not dist.is_initialized():
         if world_size == 1:
             if device_type == "cuda":
-                torch.cuda.set_device(0)
+                torch.cuda.set_device(resolve_device("cuda"))
             return False
 
         backend = "nccl" if device_type == "cuda" else "gloo"
@@ -70,10 +90,13 @@ def init_dist(
         os.environ.setdefault("WORLD_SIZE", str(world_size))
         os.environ.setdefault("LOCAL_RANK", "0")
         rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        dist.init_process_group(backend, rank=rank, world_size=world_size)
+        # Pin the device first: NCCL reads the current device while building
+        # its communicator, so binding after init_process_group leaves a
+        # window where the group and this rank's allocations disagree.
         if backend == "nccl":
-            torch.cuda.set_device(local_rank)
+            torch.cuda.set_device(resolve_device("cuda"))
+        kwargs = {} if timeout is None else {"timeout": timeout}
+        dist.init_process_group(backend, rank=rank, world_size=world_size, **kwargs)
         return True
 
     actual = dist.get_world_size()

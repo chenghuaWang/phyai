@@ -4,9 +4,9 @@ The package ships the full pi0.5 inference path:
 
 * :mod:`configuration_pi05` — frozen dataclass configs.
 * :mod:`modeling_pi05` — every ``nn.Module`` (vision tower, paligemma
-  language model with :class:`~phyai.layers.attention.ARAttention`,
+  language model with :class:`~phyai.layers.attention.PagedAttention`,
   gemma_300m action expert with
-  :class:`~phyai.layers.attention.DiffusionAttention`, action/time
+  :class:`~phyai.layers.attention.PagedAttention`, action/time
   heads, and the parameter-only :class:`PI05Model` container).
 * :mod:`model_runner_pi05` — the three runners (vision / LLM / expert)
   that wrap captured CUDA graphs around the modeling code.

@@ -11,7 +11,6 @@ the identical denoise loop; only rank 0 should persist the returned action / vid
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -33,11 +32,11 @@ from phyai.models.cosmos3.sampler_unipc import resolve_use_karras_sigmas
 from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import Cosmos3ActionRequest
 from phyai.models.cosmos3.scheduler_wn_cosmos3_policy import Cosmos3PolicyWNScheduler
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
-from phyai.utils import load_config, this_rank_log
+from phyai.utils import get_logger, load_config
 from phyai.weights import load_pretrained
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -115,11 +114,9 @@ class Cosmos3PolicyWNEntry(Entry):
             use_cuda_graph=eng.runtime.use_cuda_graph,
         )
         self.scheduler.setup()
-        this_rank_log(
-            logger,
-            logging.INFO,
-            "Cosmos3 tensor-parallel policy plugin ready (tp=%d, decode_video=%s, "
-            "flow_shift=%s, use_karras_sigmas=%s).",
+        logger.info_rank0(
+            "Cosmos3 tensor-parallel policy plugin ready (tp=%d, "
+            "decode_video=%s, flow_shift=%s, use_karras_sigmas=%s).",
             self.scheduler.tp_size,
             self.decode_video,
             args.flow_shift,

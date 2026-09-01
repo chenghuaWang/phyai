@@ -1,13 +1,11 @@
-"""phyai.layers.vocab_embedding — V-sharded input embedding and tied LM head.
+"""V-sharded input embedding and tied LM head.
 
 Quick start::
 
     import phyai.parallel as P
-    import phyai.layers.linear as L
     from phyai.layers.vocab_embedding import VocabParallelEmbedding, ParallelLMHead
 
     P.init(layout=(8,), mesh_dim_names=("tp",))
-    L.init()
 
     embed = VocabParallelEmbedding(num_embeddings=151936, embedding_dim=4096)
     lm_head = ParallelLMHead(
@@ -21,8 +19,7 @@ Quick start::
 
 The fused masked-lookup Triton kernel registers itself on import via the
 ``phyai::masked_embedding_lookup`` custom op. There is no separate
-dispatcher to prime; the layer talks to the linear-kernel dispatcher
-directly when running the LM-head matmul.
+dispatcher to prime; the LM-head matmul uses the process kernel selector.
 """
 
 from __future__ import annotations

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,11 +13,11 @@ from phyai.models.cosmos3.modeling_cosmos3 import Cosmos3Transformer
 from phyai.models.cosmos3.sampler_unipc import UniPCMultistepSampler
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE
 from phyai.runtime.schedule import Scheduler
-from phyai.utils import this_rank_log
+from phyai.utils import get_logger
 from phyai.utils.profile import event_scope
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -108,9 +107,7 @@ class Cosmos3PolicyScheduler(Scheduler):
         if self.vae_runner is not None:
             self.vae_runner.setup()
         self._ready = True
-        this_rank_log(
-            logger,
-            logging.INFO,
+        logger.info_rank0(
             "Cosmos3 policy scheduler ready (UniPC, ws=1, cuda_graph=%s).",
             self.runner.use_cuda_graph,
         )

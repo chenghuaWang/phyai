@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -26,11 +25,11 @@ from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import (
     Cosmos3PolicyScheduler,
 )
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
-from phyai.utils import load_config, this_rank_log
+from phyai.utils import get_logger, load_config
 from phyai.weights import load_pretrained
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -112,9 +111,7 @@ class Cosmos3PolicyEntry(Entry):
             use_cuda_graph=eng.runtime.use_cuda_graph,
         )
         self.scheduler.setup()
-        this_rank_log(
-            logger,
-            logging.INFO,
+        logger.info_rank0(
             "Cosmos3 policy plugin ready (decode_video=%s, flow_shift=%s, "
             "use_karras_sigmas=%s).",
             self.decode_video,

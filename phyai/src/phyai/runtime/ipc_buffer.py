@@ -61,7 +61,6 @@ Model process::
 from __future__ import annotations
 
 import ctypes
-import logging
 import multiprocessing.resource_tracker as resource_tracker
 import os
 import uuid
@@ -71,9 +70,10 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
+from phyai.utils import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------

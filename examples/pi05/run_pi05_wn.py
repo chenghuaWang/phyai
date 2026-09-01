@@ -1,18 +1,18 @@
-"""End-to-end pi0.5 data-parallel demo under torchrun (DP=N, TP=1).
+"""Run pi0.5 inference with data parallelism (DP=N, TP=1).
 
-Multi-GPU ("wn") sibling of ``run_pi05.py``. Drives the ``pi05_wn`` engine
-plugin: a full pi0.5 replica per GPU, the ``--batch-size`` request split
-statically across ``--dp`` GPUs (each card runs ``ceil(batch/dp)`` robots), rank
-0 scatters the shards and gathers the action chunks back. Only rank 0 holds the
-final ``(batch, chunk, action_dim)`` tensor.
+The ``pi05_wn`` plugin loads a complete copy of the model on every GPU. Rank 0
+splits the input batch into chunks of ``ceil(batch_size / dp)`` rows and sends
+one chunk to each GPU. It then gathers the action chunks into a
+``(batch, chunk, action_dim)`` tensor, which is kept on rank 0.
 
-Launch under torchrun with ``--nproc_per_node`` equal to ``--dp``::
+Use one torchrun process per GPU. ``--nproc_per_node`` must match ``--dp``::
 
     torchrun --nproc_per_node=8 examples/pi05/run_pi05_wn.py --dp 8 \\
         --checkpoint /path/to/pi05_base/ --batch-size 32
 
-Inputs are random (canonical tensors); action numbers are meaningless. This
-verifies the DP wiring + timing. Requires CUDA + NCCL.
+The script creates random tensors in the shapes expected by the model, so the
+returned actions have no practical meaning. Use it to check the data-parallel
+path and compare warmup and inference times. CUDA and NCCL are required.
 """
 
 from __future__ import annotations
@@ -23,6 +23,11 @@ import os
 import time
 
 import torch
+
+from phyai.utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def _resolve_topology(dp: int) -> tuple[int, int, bool]:
@@ -106,17 +111,12 @@ def main() -> None:
     dtype = torch.bfloat16
     vision_dtype = torch.float32 if args.vision_dtype == "float32" else None
 
-    def log(*a, **k):
-        if is_main:
-            print(*a, **k)
-
     plugin_cfg = load_config(args.checkpoint, PI05Config)
     inputs_image_shape = [
         [plugin_cfg.vision.image_size, plugin_cfg.vision.image_size, 3]
         for _ in range(args.num_images)
     ]
 
-    log(f"[engine] creating pi0.5 data-parallel engine (dp={dp_size})...")
     engine = Engine(
         EngineArgs(
             plugin="pi05_wn",
@@ -133,6 +133,7 @@ def main() -> None:
             ),
         )
     )
+    logger.info_rank0("[engine] created pi0.5 data-parallel engine (dp=%d).", dp_size)
 
     timings: dict[str, float] = {}
     try:
@@ -156,15 +157,15 @@ def main() -> None:
         with _timed("inference", timings):
             actions = engine.step(request)
 
-        if is_main:
-            print(f"[run] dp={dp_size} total_batch={B}")
-            print(f"action chunk shape : {tuple(actions.shape)}")
-            print(f"action chunk device: {actions.device}")
-            print(f"first action row   : {actions[0, 0].float().tolist()}")
-            print(
-                f"timing (s): warmup={timings['warmup']:.2f} "
-                f"inference={timings['inference']:.2f}"
-            )
+        logger.info_rank0("[run] dp=%d total_batch=%d", dp_size, B)
+        logger.info_rank0("action chunk shape : %s", tuple(actions.shape))
+        logger.info_rank0("action chunk device: %s", actions.device)
+        logger.info_rank0("first action row   : %s", actions[0, 0].float().tolist())
+        logger.info_rank0(
+            "timing (s): warmup=%.2f inference=%.2f",
+            timings["warmup"],
+            timings["inference"],
+        )
     finally:
         engine.close()
 
