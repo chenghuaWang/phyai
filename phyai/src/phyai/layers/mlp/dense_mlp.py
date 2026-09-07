@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 
 from phyai.kernel.call import CallSite, token_shape
+from phyai.engine_config import get_engine_config
 from phyai.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -126,11 +127,10 @@ class DenseMLP(nn.Module):
     bias:
         Bias on every internal linear. Llama / Gemma FFNs use
         ``bias=False``; SigLIP / BERT-style use ``bias=True``.
-    axis / sp_axis:
-        Mesh axis for TP and (optionally) sequence-parallel entry. The
-        entry layer (``gate_up_proj`` / ``fc1``) all-gathers along
-        ``sp_axis`` if set; the exit layer always reduces along
-        ``axis``.
+    group / sequence_parallel:
+        TP group and optional sequence parallelism. Sequence parallelism
+        gathers input tokens and reduce-scatters outputs over the same group.
+        ``None`` uses the engine's dense sequence-parallel setting.
     params_dtype:
         Dtype for parameter allocation. Defaults to torch default.
     spec_in / spec_out:
@@ -155,8 +155,8 @@ class DenseMLP(nn.Module):
         activation: Literal["silu", "gelu", "gelu_tanh"] = "silu",
         gated: bool = True,
         bias: bool = False,
-        axis: str = "tp",
-        sp_axis: str | None = None,
+        group: str = "dense_tp",
+        sequence_parallel: bool | None = None,
         params_dtype: torch.dtype | None = None,
         spec_in: object | None = None,
         spec_out: object | None = None,
@@ -171,13 +171,15 @@ class DenseMLP(nn.Module):
         self.gated = gated
         self.bias_enabled = bias
         self.prefix = prefix
+        if sequence_parallel is None:
+            sequence_parallel = get_engine_config().parallel.dense.sequence_parallel
 
         if gated:
             self.gate_up_proj = MergedColumnParallelLinear(
                 in_features=hidden_size,
                 output_sizes=[intermediate_size, intermediate_size],
-                axis=axis,
-                sp_axis=sp_axis,
+                group=group,
+                sequence_parallel=sequence_parallel,
                 gather_output=False,
                 bias=bias,
                 params_dtype=params_dtype,
@@ -189,8 +191,8 @@ class DenseMLP(nn.Module):
             self.down_proj = RowParallelLinear(
                 in_features=intermediate_size,
                 out_features=hidden_size,
-                axis=axis,
-                sp_axis=sp_axis,
+                group=group,
+                sequence_parallel=sequence_parallel,
                 input_is_parallel=True,
                 reduce_results=True,
                 bias=bias,
@@ -209,8 +211,8 @@ class DenseMLP(nn.Module):
             self.fc1 = ColumnParallelLinear(
                 in_features=hidden_size,
                 out_features=intermediate_size,
-                axis=axis,
-                sp_axis=sp_axis,
+                group=group,
+                sequence_parallel=sequence_parallel,
                 gather_output=False,
                 bias=bias,
                 params_dtype=params_dtype,
@@ -221,8 +223,8 @@ class DenseMLP(nn.Module):
             self.fc2 = RowParallelLinear(
                 in_features=intermediate_size,
                 out_features=hidden_size,
-                axis=axis,
-                sp_axis=sp_axis,
+                group=group,
+                sequence_parallel=sequence_parallel,
                 input_is_parallel=True,
                 reduce_results=True,
                 bias=bias,

@@ -28,7 +28,7 @@ overrides:
     priority: 100
     match:
       op: activation
-      model.family: [pi05, pi05_wn]
+      model.family: pi05
       attrs:
         activation: gelu
         gated: true
@@ -38,7 +38,7 @@ overrides:
     priority: 100
     match:
       op: activation
-      model.family: [pi05, pi05_wn]
+      model.family: pi05
       attrs:
         activation: gelu
         gated: false

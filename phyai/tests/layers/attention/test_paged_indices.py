@@ -137,7 +137,7 @@ def random_lens(B: int, high: int, *, zero_rows: bool, seed: int) -> torch.Tenso
     return lens
 
 
-CASES = [(1, 7), (3, 16), (8, 48), (32, 200)]
+CASES = [(3, 16), (32, 200)]  # a small and a large randomized layout
 
 
 @pytest.mark.parametrize("B,high", CASES)

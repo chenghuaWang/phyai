@@ -5,7 +5,9 @@ Quick start::
     import phyai.parallel as P
     from phyai.layers.vocab_embedding import VocabParallelEmbedding, ParallelLMHead
 
-    P.init(layout=(8,), mesh_dim_names=("tp",))
+    from phyai.engine_config import ParallelConfig, DenseParallelConfig
+
+    P.init(ParallelConfig(dense=DenseParallelConfig(tp_size=8)))
 
     embed = VocabParallelEmbedding(num_embeddings=151936, embedding_dim=4096)
     lm_head = ParallelLMHead(

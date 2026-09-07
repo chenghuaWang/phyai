@@ -265,6 +265,7 @@ class Cosmos3CausalAttention(nn.Module):
         self.to_out = RowParallelLinear(
             num_attention_heads * head_dim,
             hidden_size,
+            group="attention_tp",
             bias=False,
             input_is_parallel=True,
             params_dtype=params_dtype,
@@ -351,6 +352,7 @@ class Cosmos3CrossAttention(nn.Module):
         self.to_out = RowParallelLinear(
             num_attention_heads * head_dim,
             hidden_size,
+            group="attention_tp",
             bias=False,
             input_is_parallel=True,
             params_dtype=params_dtype,

@@ -84,6 +84,7 @@ class MiniCPMGR00TQwenGatedDeltaNet(nn.Module):
                 self.num_value_heads,
                 self.num_value_heads,
             ],
+            group="attention_tp",
             bias=False,
             params_dtype=params_dtype,
             device=device,
@@ -212,6 +213,7 @@ class MiniCPMGR00TQwenAttention(nn.Module):
         self.qkv_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [query_gate_size, key_value_size, key_value_size],
+            group="attention_tp",
             bias=config.attention_bias,
             params_dtype=params_dtype,
             device=device,
@@ -1023,6 +1025,7 @@ class MiniCPMGR00TDiTAttention(nn.Module):
             self.to_kv = MergedColumnParallelLinear(
                 context_dim,
                 [self.hidden_size, self.hidden_size],
+                group="attention_tp",
                 bias=True,
                 params_dtype=params_dtype,
                 device=device,

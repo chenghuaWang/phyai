@@ -6,7 +6,7 @@ import torch
 
 from phyai.cache import KVCachePool
 from phyai.utils import get_logger
-from phyai.payload import (
+from phyai.models.pi05.forward_batch_pi05 import (
     LLMForwardBatch,
     VisionForwardBatch,
 )

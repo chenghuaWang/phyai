@@ -13,7 +13,6 @@ Override the library path with ``PHYAI_NCCL_SO_PATH`` if needed.
 from __future__ import annotations
 
 import ctypes
-import os
 import platform
 from dataclasses import dataclass
 from typing import Any
@@ -21,13 +20,14 @@ from typing import Any
 import torch
 from torch.distributed import ReduceOp
 
+from phyai.env import envs
 from phyai.utils import get_logger
 
 logger = get_logger(__name__)
 
 
 def find_nccl_library() -> str:
-    so_file = os.environ.get("PHYAI_NCCL_SO_PATH")
+    so_file = envs.PHYAI_NCCL_SO_PATH.get()
     if so_file:
         logger.info_rank0("Using PHYAI_NCCL_SO_PATH=%s", so_file)
         return so_file

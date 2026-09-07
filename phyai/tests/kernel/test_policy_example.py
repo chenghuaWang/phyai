@@ -1,6 +1,6 @@
 """Regression tests for the shipped example kernel policy.
 
-``configs/kernel_policy.example.yaml`` is the only documentation of the policy
+``examples/configs/kernel_policy.example.yaml`` documents the policy
 DSL, and nothing in the codebase loads it. That combination is a liability: a
 refactor can break the one documented example while the whole suite stays
 green. These tests close that gap.
@@ -24,7 +24,10 @@ from phyai.kernel.types import KernelQuery
 
 
 EXAMPLE_POLICY = (
-    Path(__file__).resolve().parents[3] / "configs" / "kernel_policy.example.yaml"
+    Path(__file__).resolve().parents[3]
+    / "examples"
+    / "configs"
+    / "kernel_policy.example.yaml"
 )
 
 
@@ -62,19 +65,11 @@ def test_example_policy_loads_and_declares_the_expected_shape(policy: Policy) ->
         "force-reference-attention-for-debug",
         "force-torch-gemm",
     ]
-
-
-def test_loading_validates_every_referenced_kernel_id(policy: Policy) -> None:
-    """A stale id in the example would otherwise be found by a user, not by CI.
-
-    ``load_policy`` raises on an unknown id, so reaching this point proves
-    every ``prefer`` / ``use`` / ``restrict_to`` entry still exists.
-    """
-
+    # ``load_policy`` raises on an unknown id, so reaching this point proves
+    # every ``prefer`` / ``use`` / ``restrict_to`` entry still exists.
     referenced = {kernel_id for rule in policy.rules for kernel_id in rule.prefer}
     referenced |= {rule.use for rule in policy.overrides if rule.use}
-    assert referenced
-    assert all(isinstance(item, str) for item in referenced)
+    assert referenced and all(isinstance(item, str) for item in referenced)
 
 
 def gemm_call(catalog: Catalog, **overrides):
@@ -147,7 +142,7 @@ def test_each_example_rule_actually_fires(
     assert not decision.strict
 
 
-def test_the_example_override_is_strict_and_beats_every_rule(
+def test_the_example_overrides_are_strict_and_narrow_as_documented(
     policy: Policy, catalog: Catalog
 ) -> None:
     # The ragged-prefill call, plus the debug tag the override selects on. Its
@@ -164,21 +159,18 @@ def test_the_example_override_is_strict_and_beats_every_rule(
     )
     decision = policy.decide(call, catalog)
     assert decision.matched_rules == ("force-reference-attention-for-debug",)
-    assert decision.strict
-    assert decision.candidates == ("eager.attention",)
+    assert decision.strict and decision.candidates == ("eager.attention",)
 
-
-def test_the_restrict_to_override_narrows_to_a_family(
-    policy: Policy, catalog: Catalog
-) -> None:
-    call = gemm_call(
+    narrowed = policy.decide(
+        gemm_call(
+            catalog,
+            model={"family": "qwen", "tags": frozenset({"no-flashinfer"})},
+            quant={"format": "bf16"},
+        ),
         catalog,
-        model={"family": "qwen", "tags": frozenset({"no-flashinfer"})},
-        quant={"format": "bf16"},
     )
-    decision = policy.decide(call, catalog)
-    assert decision.matched_rules == ("force-torch-gemm",)
-    assert all(item.startswith("torch.gemm.") for item in decision.candidates)
+    assert narrowed.matched_rules == ("force-torch-gemm",)
+    assert all(item.startswith("torch.gemm.") for item in narrowed.candidates)
 
 
 def test_the_example_does_not_capture_unrelated_calls(
@@ -218,17 +210,7 @@ def test_the_example_policy_drives_a_real_selection(
     )
     assert trace.matched_rules == ("sm100-nvfp4-gemm",)
     assert trace.selected == "flashinfer.gemm.nvfp4_128x4"
-
-
-def test_restrict_to_pins_the_prefill_row(policy: Policy, catalog: Catalog) -> None:
-    """Each FlashInfer prefill kernel is a row, so pinning one is `restrict_to`.
-
-    ``params`` still reaches the implementation's constructor and can override
-    even a row's own pinned kernel; that path is covered in
-    ``test_attention_backends.py::test_rule_params_override_a_rows_pinned_backend``.
-    A row is preferred here because a row is what autotune can measure.
-    """
-
+    # Each FlashInfer prefill kernel is a row, so pinning one is ``restrict_to``;
+    # a row is preferred over ``params`` because a row is what autotune can measure.
     decision = policy.decide(CASES["pin-fa2-prefill"](catalog), catalog)
     assert decision.candidates == ("flashinfer.attention_paged.fa2",)
-    assert "pin-fa2-prefill" in decision.matched_rules

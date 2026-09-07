@@ -451,6 +451,7 @@ class PaliGemmaDecoderLayer(nn.Module):
             1, self.qkv_proj.num_kv_heads * self.qkv_proj.num_kv_replicas
         )
         self.o_proj = RowParallelLinear(
+            group="attention_tp",
             in_features=config.num_attention_heads * config.head_dim,
             out_features=config.hidden_size,
             bias=False,
@@ -685,6 +686,7 @@ class PI05ExpertLayer(nn.Module):
         # paligemma stream), and o_proj reduces back down to the
         # expert's ``hidden_size = 1024``.
         self.o_proj = RowParallelLinear(
+            group="attention_tp",
             in_features=config.num_attention_heads * config.head_dim,
             out_features=config.hidden_size,
             bias=False,

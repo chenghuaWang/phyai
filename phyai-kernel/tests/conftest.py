@@ -18,22 +18,17 @@ The autouse fixture below:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 
+from phyai.engine_config import ParallelConfig
 from phyai.kernel.bootstrap import kernel_selector_scope
 from phyai.parallel.mesh import Mesh
 from phyai.parallel.state import _meshes, register_mesh
+from phyai.parallel.layout import build_rank_layout
 
 
 def _register_fake_mesh(name: str = "model") -> Mesh:
-    tm = MagicMock()
-    tm.mesh_dim_names = ()
-    tm.size.side_effect = lambda axis=None: 1
-    tm.get_local_rank.side_effect = lambda axis=None: 0
-    tm.get_group.side_effect = lambda axis: MagicMock(name=f"pg-{axis}")
-    mesh = Mesh(tm, name=name)
+    mesh = Mesh(build_rank_layout(ParallelConfig()), name=name)
     register_mesh(mesh)
     return mesh
 

@@ -1,155 +1,4 @@
-"""TransformerBlock — unified pre-norm / sandwich-norm transformer block.
-
-One class for two attention flavors, chosen by the ``attn_kind``
-argument:
-
-* ``attn_kind="attention"`` (default) -> :class:`Attention`. No KV
-  cache. Suitable for SigLIP-style vision encoders or any prefill-only
-  path. Forward takes ``cu_seqlens_q`` / ``cu_seqlens_kv`` for ragged
-  input or builds a default ctx from the q/k layout.
-* ``attn_kind="paged"`` (requires ``layer_idx: int``) -> :class:`PagedAttention`
-  bound to that ``layer_id``. Paged-KV attention for LM prefixes,
-  action experts, and AR decoders alike. Forward expects an
-  ``attn_ctx`` from the runner; K/V get scattered into
-  ``attn_ctx.kv_pool`` at ``attn_ctx.write_indices``.
-
-Two normalisation topologies, optional Q/K head-dim norm:
-
-* **Pre-norm** (Llama / Qwen2 / Qwen2.5 / Qwen3 / Mistral / Phi3 /
-  SigLIP encoder)::
-
-      h = x + attn(input_norm(x))
-      y = h + mlp(pre_ff_norm(h))
-
-* **Sandwich norm** (``sandwich_norm=True``; Gemma2 / Gemma3)::
-
-      h = x + post_attn_norm(attn(input_norm(x)))
-      y = h + post_ff_norm(mlp(pre_ff_norm(h)))
-
-When ``attn_qk_norm=True`` the block additionally normalises Q and K
-on the per-head ``head_dim`` axis after the QKV projection and before
-RoPE — used by Gemma3 (gemma-style ``(1+w)`` RMS) and Qwen3 (standard
-RMS).
-
-Branch-free forward
--------------------
-Every optional knob is resolved at __init__ into a concrete module slot
-(:class:`torch.nn.Identity` stand-ins for the disabled cases) plus a
-bound :attr:`_attn_forward` method pointer that captures the differing
-:class:`Attention` / :class:`PagedAttention` call signatures. ``forward()`` itself contains zero ``if`` statements.
-
-Knob matrix
------------
-
-================  ========================================================
-group             knobs
-================  ========================================================
-mode              ``attn_kind`` (``"attention"`` / ``"paged"``);
-                  ``layer_idx`` (optional stack-position metadata for
-                  ``"attention"`` — ignored; required for ``"paged"``)
-norm              ``norm_type`` (rmsnorm / gemma_rmsnorm / layernorm),
-                  ``norm_eps``, ``norm_bias`` (LN only), ``norm_backend``,
-                  ``sandwich_norm`` (off -> 2 norms; on -> 4 norms)
-attention         ``num_heads``, ``num_kv_heads``, ``head_dim``,
-                  ``attn_causal``, ``attn_sliding_window``
-                  (``"attention"`` only),
-                  ``attn_logits_soft_cap`` (``"attention"`` only),
-                  ``attn_scale``,
-                  ``attn_bias`` (q/k/v), ``attn_out_bias`` (o-proj),
-                  ``attn_qk_norm`` (per-head Q/K norm), ``attn_backend``
-RoPE              ``rope`` (a :class:`RotaryEmbedding` instance shared
-                  across layers, or ``None`` for vision encoders / when
-                  positions don't apply); ``precompute_rope`` (Pattern A
-                  vs Pattern B — see "RoPE patterns" below)
-MLP               ``intermediate_size``, ``mlp_gated``, ``mlp_activation``,
-                  ``mlp_bias``
-TP                ``axis`` / ``sp_axis`` / ``mesh``
-quant             ``spec_qkv`` / ``spec_o`` / ``spec_mlp_in`` /
-                  ``spec_mlp_out`` (per-leg :class:`WeightSpec`)
-HF naming         **required**: ``norm_hf_names`` (per-position),
-                  ``attn_out_hf_name`` (Llama/Gemma ``"o_proj"`` vs SigLIP
-                  ``"out_proj"``); optional: ``attn_qkv_hf_names``,
-                  ``mlp_gated_hf_names``
-================  ========================================================
-
-The block is a **structural primitive** — HF naming conventions belong
-to the model that uses it. The two highly-divergent knobs are required
-arguments; the two truly-universal-ish ones (Q/K/V, gated MLP) keep
-sensible defaults that match every modern decoder phyai targets (and
-SigLIP, for the QKV side).
-
-Forward
--------
-``forward(x, *, positions=None, attn_ctx=None, cu_seqlens_q=None, cu_seqlens_kv=None, cos=None, sin=None) -> y``
-
-* ``x``: ``(B, S, hidden_size)`` for padded batches, ``(nnz, hidden_size)``
-  for ragged. Output preserves the leading shape.
-* ``positions``: required in **Pattern A** (``precompute_rope=False``,
-  the default) — ``(B, S)`` / ``(S,)`` for padded, ``(nnz,)`` for ragged.
-  Ignored in Pattern B.
-* ``cos`` / ``sin``: required in **Pattern B**
-  (``precompute_rope=True``) — pre-gathered cos/sin tensors from
-  :meth:`RotaryEmbedding.get_cos_sin`. Ignored in Pattern A.
-* ``attn_ctx``: required for ``attn_kind="paged"``
-  (the runner builds the ctx per step); optional for
-  ``attn_kind="attention"`` (:class:`Attention` builds a default ctx
-  if absent).
-* ``cu_seqlens_q`` / ``cu_seqlens_kv``: int32 ``(B+1,)`` for ragged
-  input in ``attn_kind="attention"``. Ignored in the paged kind (the
-  paged attention reads cu_seqlens off the runner-built ``attn_ctx``).
-
-RoPE patterns
--------------
-* **Pattern A** (``precompute_rope=False``, default): per-layer fused
-  gather-and-rotate via :meth:`RotaryEmbedding.forward(positions, q, k)`.
-  Argument order is ``(positions, q, k)`` to match the kernel's
-  position-then-rotation contract. The flashinfer kernel does the
-  position -> cos/sin lookup in-kernel.
-* **Pattern B** (``precompute_rope=True``): the caller (typically the
-  stack) calls :meth:`RotaryEmbedding.get_cos_sin(positions)` once,
-  then threads the resulting ``(cos, sin)`` to every layer's forward as
-  ``cos`` / ``sin``. Each layer skips the cache gather and
-  runs only the rotation via :meth:`RotaryEmbedding.apply`.
-  Helpful for cuda-graph capture (one less kernel inside the captured
-  region per layer) and deep stacks where the gather appears in profiles.
-
-The pattern is fixed at construction; :meth:`forward` dispatches via a
-bound :attr:`_apply_rope` method pointer with zero ``if`` on rope
-configuration.
-
-Norm-position keys
-------------------
-
-================  ===============================  ===============================
-position           pre-norm                          sandwich norm
-================  ===============================  ===============================
-``input_norm``     ✓                                ✓
-``post_attn_norm`` —                                ✓
-``pre_ff_norm``    ✓                                ✓
-``post_ff_norm``   —                                ✓
-================  ===============================  ===============================
-
-``norm_hf_names`` must contain *exactly* the keys for the chosen
-topology (``{input_norm, pre_ff_norm}`` for pre-norm,
-``{input_norm, post_attn_norm, pre_ff_norm, post_ff_norm}`` for
-sandwich) — extra or missing keys are rejected at construction. When
-``attn_qk_norm=True``, the q/k norms are HF-named ``q_norm`` / ``k_norm``
-inside ``self_attn`` (universal across Gemma3 / Qwen3).
-
-The attention sub-prefix is always ``self_attn`` and the MLP sub-prefix
-is always ``mlp``.
-
-Limitations
------------
-* The paged kind does not yet accept
-  ``attn_sliding_window`` / ``attn_logits_soft_cap`` (raises
-  :class:`NotImplementedError` at construction); the paged attention
-  classes do not surface them today.
-* No append-prefill mode in no-cache mode. Q and K must share token
-  count.
-* No fused FP8 RoPE / Q/K quant.
-* No cross-attention (decoder-only / encoder-only).
-"""
+"""TransformerBlock"""
 
 from __future__ import annotations
 
@@ -159,6 +8,7 @@ from typing import Any, Literal, Mapping
 import torch
 import torch.nn as nn
 
+from phyai.engine_config import get_engine_config
 from phyai.layers.attention.nocache import Attention, AttnCtx
 from phyai.layers.attention.paged import PagedAttention, PagedAttnCtx
 from phyai.layers.layer_norm import GemmaRMSNorm, LayerNorm, RMSNorm
@@ -167,6 +17,7 @@ from phyai.layers.linear.layers import (
     RowParallelLinear,
 )
 from phyai.layers.mlp.dense_mlp import DenseMLP
+from phyai.parallel.state import resolve_mesh
 
 
 # HuggingFace de-facto norm naming defaults. Llama / Qwen2 / Qwen3 / Mistral /
@@ -351,8 +202,9 @@ class TransformerBlock(nn.Module):
         norm_bias: bool = False,
         norm_backend: str | None = None,
         # ---- TP / mesh -------------------------------------------------- #
-        axis: str = "tp",
-        sp_axis: str | None = None,
+        attention_group: str = "attention_tp",
+        dense_group: str = "dense_tp",
+        sequence_parallel: bool | None = None,
         mesh: str = "model",
         # ---- Quant specs ------------------------------------------------ #
         spec_qkv: object | None = None,
@@ -367,6 +219,9 @@ class TransformerBlock(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+
+        if sequence_parallel is None:
+            sequence_parallel = get_engine_config().parallel.dense.sequence_parallel
 
         if norm_type not in _VALID_NORM_TYPES:
             raise ValueError(
@@ -446,13 +301,28 @@ class TransformerBlock(nn.Module):
             self.post_attn_norm = nn.Identity()
             self.post_ff_norm = nn.Identity()
 
+        mesh_obj = resolve_mesh(mesh)
+        if (
+            mesh_obj.group_size("attention_cp") > 1
+            or mesh_obj.group_size("attention_decode_cp") > 1
+        ):
+            raise NotImplementedError(
+                "TransformerBlock requires a model-specific context-parallel attention implementation."
+            )
+        if mesh_obj.group_members(attention_group) != mesh_obj.group_members(
+            dense_group
+        ):
+            raise NotImplementedError(
+                "TransformerBlock requires matching attention/dense token layouts; "
+                "the model must provide token redistribution between different TP groups."
+            )
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
             head_dim=head_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
-            axis=axis,
-            sp_axis=sp_axis,
+            group=attention_group,
+            sequence_parallel=sequence_parallel,
             gather_output=False,
             bias=attn_bias,
             params_dtype=params_dtype,
@@ -568,8 +438,8 @@ class TransformerBlock(nn.Module):
         self.o_proj = RowParallelLinear(
             in_features=num_heads * head_dim,
             out_features=hidden_size,
-            axis=axis,
-            sp_axis=sp_axis,
+            group=attention_group,
+            sequence_parallel=sequence_parallel,
             input_is_parallel=True,
             reduce_results=True,
             bias=attn_out_bias,
@@ -585,8 +455,8 @@ class TransformerBlock(nn.Module):
             activation=mlp_activation,
             gated=mlp_gated,
             bias=mlp_bias,
-            axis=axis,
-            sp_axis=sp_axis,
+            group=dense_group,
+            sequence_parallel=sequence_parallel,
             params_dtype=params_dtype,
             spec_in=spec_mlp_in,
             spec_out=spec_mlp_out,
@@ -695,7 +565,7 @@ class TransformerBlock(nn.Module):
         fused, _ = self.qkv_proj(h)
         q, k, v = _split_qkv(
             fused,
-            x.shape[:-1],
+            fused.shape[:-1],
             self.q_heads_local,
             self.kv_heads_local,
             self.head_dim,

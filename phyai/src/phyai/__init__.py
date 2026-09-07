@@ -17,6 +17,8 @@ _LAZY: dict[str, str] = {
     # phyai.engine
     "Engine": "phyai.engine",
     "EngineArgs": "phyai.engine",
+    "DeploymentConfig": "phyai.server.deployment",
+    "EngineUnavailableError": "phyai.server.lifecycle",
     "Entry": "phyai.engine",
     "EntryArgs": "phyai.engine",
     # phyai.engine_config
@@ -25,6 +27,10 @@ _LAZY: dict[str, str] = {
     "EngineConfig": "phyai.engine_config",
     "KernelConfig": "phyai.engine_config",
     "ParallelConfig": "phyai.engine_config",
+    "OuterParallelConfig": "phyai.engine_config",
+    "DenseParallelConfig": "phyai.engine_config",
+    "AttentionParallelConfig": "phyai.engine_config",
+    "MoeParallelConfig": "phyai.engine_config",
     "RuntimeConfig": "phyai.engine_config",
     "get_engine_config": "phyai.engine_config",
     "init_engine_config": "phyai.engine_config",
@@ -35,12 +41,18 @@ _LAZY: dict[str, str] = {
 # so ``from phyai import Engine`` resolves under mypy / pyright / autocomplete.
 if TYPE_CHECKING:
     from phyai.engine import Engine, EngineArgs, Entry, EntryArgs
+    from phyai.server.deployment import DeploymentConfig
+    from phyai.server.lifecycle import EngineUnavailableError
     from phyai.engine_config import (
         BackendConfig,
         DeviceConfig,
         EngineConfig,
         KernelConfig,
         ParallelConfig,
+        OuterParallelConfig,
+        DenseParallelConfig,
+        AttentionParallelConfig,
+        MoeParallelConfig,
         RuntimeConfig,
         get_engine_config,
         init_engine_config,
@@ -67,6 +79,8 @@ __all__ = [
     # engine
     "Engine",
     "EngineArgs",
+    "DeploymentConfig",
+    "EngineUnavailableError",
     "Entry",
     "EntryArgs",
     # engine config
@@ -75,6 +89,10 @@ __all__ = [
     "BackendConfig",
     "DeviceConfig",
     "ParallelConfig",
+    "OuterParallelConfig",
+    "DenseParallelConfig",
+    "AttentionParallelConfig",
+    "MoeParallelConfig",
     "RuntimeConfig",
     "get_engine_config",
     "set_engine_config",

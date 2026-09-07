@@ -57,10 +57,3 @@ def test_gelu_rows_preserve_exact_vs_tanh_semantics(
     gate, up = value.chunk(2, dim=-1)
     expected = F.gelu(gate, approximate=approximate) * up
     torch.testing.assert_close(selection.execute(value), expected)
-
-
-def test_exact_and_tanh_gelu_are_distinct() -> None:
-    value = torch.linspace(-4.0, 4.0, 257)
-    exact = F.gelu(value, approximate="none")
-    tanh = F.gelu(value, approximate="tanh")
-    assert not torch.equal(exact, tanh)

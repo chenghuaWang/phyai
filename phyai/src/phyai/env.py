@@ -97,6 +97,15 @@ class envs:
 
     # Backend and kernel selection.
     PHYAI_VGPU_BACKEND = EnvField("PHYAI_VGPU_BACKEND", None, str)
+    # Prefer one collective (communication) backend by name: "nccl", "pynccl"
+    # or "gloo". It wins whenever it can serve the call and falls back
+    # otherwise (pynccl declines eager mode). Distinct from the vGPU backend
+    # and from kernel policies.
+    PHYAI_FORCE_COLLECTIVE_BACKEND = EnvField(
+        "PHYAI_FORCE_COLLECTIVE_BACKEND", None, str
+    )
+    # Explicit libnccl path for the ctypes pynccl backend.
+    PHYAI_NCCL_SO_PATH = EnvField("PHYAI_NCCL_SO_PATH", None, str)
     PHYAI_KERNEL_CONFIG = EnvField("PHYAI_KERNEL_CONFIG", None, str)
     PHYAI_KERNEL_PROFILE = EnvField("PHYAI_KERNEL_PROFILE", None, str)
     PHYAI_KERNEL_AUTOTUNE_CACHE = EnvField("PHYAI_KERNEL_AUTOTUNE_CACHE", None, str)
@@ -127,15 +136,6 @@ class envs:
     # Skip PhyAI environment tuning.
     PHYAI_SKIP_ENV_SETUP = EnvField("PHYAI_SKIP_ENV_SETUP", None, _parse_bool)
 
-    # Parallel sizes.
-    PHYAI_WORLD_SIZE = EnvField("PHYAI_WORLD_SIZE", None, int)
-    PHYAI_DP_SIZE = EnvField("PHYAI_DP_SIZE", None, int)
-    PHYAI_CFG_SIZE = EnvField("PHYAI_CFG_SIZE", None, int)
-    PHYAI_EP_SIZE = EnvField("PHYAI_EP_SIZE", None, int)
-    PHYAI_SP_SIZE = EnvField("PHYAI_SP_SIZE", None, int)
-    PHYAI_CP_SIZE = EnvField("PHYAI_CP_SIZE", None, int)
-    PHYAI_TP_SIZE = EnvField("PHYAI_TP_SIZE", None, int)
-
     # Low-level tuning.
     PHYAI_FLASHINFER_WORKSPACE_BYTES = EnvField(
         "PHYAI_FLASHINFER_WORKSPACE_BYTES", None, int
@@ -151,8 +151,18 @@ class envs:
     )
 
 
-#: Removed variables mapped to migration guidance.
+#: Removed variables are rejected instead of silently changing topology.
 REMOVED_ENV_VARS: dict[str, str] = {
+    "PHYAI_REPLICA_COUNT": "DeploymentConfig(replica_count=...)",
+    "PHYAI_CFG_SIZE": "EngineConfig.parallel.outer.cfg_size",
+    "PHYAI_TP_SIZE": "EngineConfig.parallel.dense.tp_size",
+    "PHYAI_EP_SIZE": "EngineConfig.parallel.moe.ep_size",
+    "PHYAI_SP_SIZE": "EngineConfig.parallel.dense.sequence_parallel",
+    "PHYAI_CP_SIZE": "EngineConfig.parallel.attention.cp_size",
+    "PHYAI_DP_SIZE": "DeploymentConfig(replica_count=...)",
+    "PHYAI_WORLD_SIZE": (
+        "the launcher or local deployment determines the replica world size"
+    ),
     "PHYAI_ATTN_BACKEND": (
         "a kernel policy rule -- e.g. "
         "`rules: [{match: {op: attention}, restrict_to: 'sdpa.attention'}]` "
@@ -181,6 +191,26 @@ REMOVED_ENV_VARS: dict[str, str] = {
         "attention site in the process, and its single valid-name set was "
         "written for the paged wrapper while the no-cache stack uses the ragged "
         "one, which accepts a different set"
+    ),
+    "PHYAI_FORCE_BACKEND": (
+        "PHYAI_FORCE_COLLECTIVE_BACKEND with the same value (nccl / pynccl / "
+        "gloo); the old name did not say which backend it forced"
+    ),
+    "PHYAI_REPLICA_ID": (
+        "the WorkerPlacement handed to the worker factory (replica_id); the "
+        "supervisor no longer mirrors placement into the environment"
+    ),
+    "PHYAI_WORKER_ID": (
+        "the WorkerPlacement handed to the worker factory (worker_id); the "
+        "supervisor no longer mirrors placement into the environment"
+    ),
+    "PHYAI_REPLICA_NODE_COUNT": (
+        "nothing: placement is probed at runtime by phyai.parallel.init (node "
+        "identity gathered over the process group, NVLink checked with NVML)"
+    ),
+    "PHYAI_REPLICA_GPUS_PER_NODE": (
+        "nothing: placement is probed at runtime by phyai.parallel.init (node "
+        "identity gathered over the process group, NVLink checked with NVML)"
     ),
     "PHYAI_FORCE_LINEAR_KERNEL": (
         "a kernel policy rule -- e.g. "

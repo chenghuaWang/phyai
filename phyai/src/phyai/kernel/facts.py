@@ -286,7 +286,7 @@ lib = LibNamespace()
 
 #: Top-level facts that are not part of any namespace. ``role`` is the
 #: policy-visible half of a call site's identity (see the A/B recipes in
-#: configs/kernel_policy.example.yaml); ``mode`` is matched by capability
+#: examples/configs/kernel_policy.example.yaml); ``mode`` is matched by capability
 #: gating in the selector, not by policies, so it has no Fact object.
 op = Fact("op", FactKind.STR)
 role = Fact("role", FactKind.STR)

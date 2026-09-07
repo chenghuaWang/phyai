@@ -1,12 +1,10 @@
-"""Library availability probing.
+"""Library availability probing: "installed" is not "importable".
 
-The behaviour under test is the difference between "installed" and
-"importable". A package whose native extension fails to load — flashinfer on
-a host with a mismatched CUDA or a missing driver library — is *installed*, so
-a module-spec check reports it as present. Every kernel gated on it then
-claims to be eligible, preparation throws, the selector silently falls through
-to the next candidate, and the trace records a viable kernel that never was.
-One raised exception per cache miss, and a lie in the diagnostics.
+A package whose native extension fails to load (flashinfer on a host with a
+mismatched CUDA) is *installed*, so a module-spec check reports it present.
+Every kernel gated on it then claims eligibility, preparation throws, the
+selector silently falls through, and the trace records a viable kernel that
+never was.
 """
 
 from __future__ import annotations
@@ -26,7 +24,6 @@ def _clear_probe_cache():
 @pytest.fixture
 def fake_import(monkeypatch: pytest.MonkeyPatch):
     """Replace ``import_module`` with a scripted one, recording each call."""
-
     calls: list[str] = []
     real = library.importlib.import_module
 
@@ -44,71 +41,44 @@ def fake_import(monkeypatch: pytest.MonkeyPatch):
     return install
 
 
-def test_importable_module_is_available() -> None:
+def test_installed_but_unimportable_modules_are_unavailable(fake_import):
+    """A broken native extension raises from the dynamic loader (an ``OSError``,
+    not an ``ImportError``) and may even exit, which is why the probe catches
+    ``BaseException``."""
+    fake_import(
+        lambda target: OSError("libcuda.so.1: cannot open shared object file")
+        if target == "flashinfer"
+        else (SystemExit(1) if target == "brittle" else None)
+    )
     assert library.library_available("json")
-
-
-def test_missing_module_is_unavailable() -> None:
+    assert not library.library_available("flashinfer")
+    assert not library.library_available("brittle")
     assert not library.library_available("phyai_no_such_module_xyz")
 
 
-def test_installed_but_unimportable_module_is_unavailable(fake_import) -> None:
-    """The case a module-spec check gets wrong.
-
-    A broken native extension raises from the dynamic loader — an ``OSError``,
-    not an ``ImportError`` — which is why the probe catches broadly.
-    """
-
-    fake_import(
-        lambda target: (
-            OSError("libcuda.so.1: cannot open shared object file")
-            if target == "flashinfer"
-            else None
-        )
+def test_both_outcomes_are_memoized(fake_import):
+    """At most one import attempt per library per process; otherwise every
+    selector cache miss pays another failed import."""
+    calls = fake_import(
+        lambda target: ImportError("nope") if target == "absent" else None
     )
-    assert not library.library_available("flashinfer")
+    assert library.library_available("json") and library.library_available("json")
+    assert not library.library_available("absent") and not library.library_available(
+        "absent"
+    )
+    assert calls == ["json", "absent"]
 
 
-def test_a_module_raising_systemexit_is_also_unavailable(fake_import) -> None:
-    """``BaseException``, not ``Exception``: a broken extension can exit."""
-
-    fake_import(lambda target: SystemExit(1) if target == "brittle" else None)
-    assert not library.library_available("brittle")
-
-
-def test_success_is_memoized(fake_import) -> None:
-    """At most one import attempt per library per process."""
-
-    calls = fake_import(lambda _target: None)
-    assert library.library_available("json")
-    assert library.library_available("json")
-    assert calls == ["json"]
-
-
-def test_failure_is_memoized_too(fake_import) -> None:
-    """Otherwise every selector cache miss pays another failed import."""
-
-    calls = fake_import(lambda _target: ImportError("nope"))
-    assert not library.library_available("absent")
-    assert not library.library_available("absent")
-    assert calls == ["absent"]
-
-
-def test_library_facts_builds_lib_prefixed_paths() -> None:
-    """These feed the ``lib.*`` facts that capability predicates read."""
-
+def test_library_facts_builds_lib_prefixed_paths():
     values = library.library_facts(frozenset({"json", "phyai_no_such_module_xyz"}))
     assert values == {"lib.json": True, "lib.phyai_no_such_module_xyz": False}
 
 
-def test_flashinfer_probe_matches_reality_on_this_host() -> None:
-    """Cross-check the probe against an actual import."""
-
+def test_flashinfer_probe_matches_reality_on_this_host():
     try:
         import flashinfer  # noqa: F401
     except BaseException:
         expected = False
     else:
         expected = True
-
     assert library.library_available("flashinfer") is expected

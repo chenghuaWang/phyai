@@ -17,8 +17,12 @@ dependencies = [
     "tqdm",
     "pyyaml",
     "setproctitle",
-    "flash-qla"
+    "flash-qla",
+    "nvidia-ml-py",
 ]
+
+[project.scripts]
+phyai = "phyai.cli:main"
 
 [project.optional-dependencies]
 ext = ["phyai-ext"]
