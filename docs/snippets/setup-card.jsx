@@ -40,7 +40,7 @@ export const SetupCard = ({ rows = {} }) => {
                                         onClick={() => interactive && setSelection(key, i)}
                                         className={`flex-1 rounded-md px-3 py-2 text-sm transition-colors ${
                                             selected
-                                                ? "bg-[#003399] dark:bg-[#2563EB] text-white font-medium"
+                                                ? "setup-option-selected text-white font-medium"
                                                 : "bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700"
                                         } ${interactive ? "cursor-pointer" : "cursor-default"}`}
                                     >
