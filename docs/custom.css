@@ -1,0 +1,7 @@
+.setup-option-selected {
+  background-color: #003399;
+}
+
+.dark .setup-option-selected {
+  background-color: #2563eb;
+}
