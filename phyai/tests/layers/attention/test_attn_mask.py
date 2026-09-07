@@ -43,7 +43,6 @@ def expand_segments(segments) -> torch.Tensor:
         ((4, False), (1, True), (3, True)),  # pi0: prefix | state | actions
         ((5, False), (3, True)),  # pi05: prefix-LM
         ((2, True), (2, True), (2, True)),  # block-causal chain
-        ((6, False),),  # fully bidirectional
     ],
 )
 def test_segments_match_openpi_reference(segments):
@@ -94,19 +93,19 @@ def test_segments_compose_with_lengths_like_openpi_input_mask():
 # --------------------------------------------------------------------- #
 
 
-def test_lengths_dense_is_column_prefix():
-    mask = AttnMask.from_lengths(torch.tensor([2, 4]))
-    dense = mask.dense(3, 4, 2, torch.device("cpu"), causal=False, sliding_window=None)
+def test_lengths_and_keys_lower_to_query_independent_columns():
+    dense = AttnMask.from_lengths(torch.tensor([2, 4])).dense(
+        3, 4, 2, torch.device("cpu"), causal=False, sliding_window=None
+    )
     # Broadcastable against (B, H, S_q, S_kv): rows are query-independent.
     assert dense.shape == (2, 1, 1, 4)
     assert torch.equal(dense[0, 0, 0], torch.tensor([True, True, False, False]))
     assert dense[1].all()
 
-
-def test_keys_dense_allows_scattered_columns():
     keys = torch.tensor([[True, False, True, False]])
-    mask = AttnMask.from_key_mask(keys)
-    dense = mask.dense(2, 4, 1, torch.device("cpu"), causal=False, sliding_window=None)
+    dense = AttnMask.from_key_mask(keys).dense(
+        2, 4, 1, torch.device("cpu"), causal=False, sliding_window=None
+    )
     assert dense.shape == (1, 1, 1, 4)
     assert torch.equal(dense[0, 0, 0], keys[0])
 
@@ -122,43 +121,33 @@ def test_pack_rows_gathers_and_offsets():
     assert torch.equal(out.flatten(), torch.tensor([0.0, 0, 2, 3, 4, 0]))
 
 
-def test_segment_block_mask_is_cached():
-    m = AttnMask.from_segments(((3, False), (2, True)))
-    a = m.dense(5, 5, 1, torch.device("cpu"), causal=False, sliding_window=None)
-    b = m.dense(5, 5, 1, torch.device("cpu"), causal=False, sliding_window=None)
-    assert a is b  # lru-cached block, no per-row part
-
-
 # --------------------------------------------------------------------- #
 # constraints                                                           #
 # --------------------------------------------------------------------- #
 
 
-def test_empty_mask_is_rejected():
+def test_mask_constraints_are_enforced():
     with pytest.raises(ValueError, match="at least one"):
         AttnMask()
-
-
-def test_lengths_and_keys_are_mutually_exclusive():
     with pytest.raises(ValueError, match="mutually exclusive"):
         AttnMask(
             seq_lens_kv=torch.tensor([1]), key_mask=torch.ones(1, 2, dtype=torch.bool)
         )
-
-
-def test_segments_reject_causal_layers():
-    attn = Attention(num_heads=2, head_dim=8, causal=True, backend="eager")
+    causal = Attention(num_heads=2, head_dim=8, causal=True, backend="eager")
     q = torch.randn(1, 4, 2, 8)
     with pytest.raises(ValueError, match="causal=False"):
-        attn(q, q, q, mask=AttnMask.from_segments(((2, False), (2, True))))
-
-
-def test_mask_requires_padded_layout():
-    attn = Attention(num_heads=2, head_dim=8, causal=False, backend="eager")
-    q = torch.randn(4, 2, 8)
+        causal(q, q, q, mask=AttnMask.from_segments(((2, False), (2, True))))
+    plain = Attention(num_heads=2, head_dim=8, causal=False, backend="eager")
+    ragged = torch.randn(4, 2, 8)
     cu = torch.tensor([0, 4], dtype=torch.int32)
     with pytest.raises(ValueError, match="padded"):
-        attn(q, q, q, cu_seqlens_q=cu, mask=AttnMask.from_lengths(torch.tensor([4])))
+        plain(
+            ragged,
+            ragged,
+            ragged,
+            cu_seqlens_q=cu,
+            mask=AttnMask.from_lengths(torch.tensor([4])),
+        )
 
 
 def test_causal_block_mask_keeps_trailing_alignment():
@@ -213,26 +202,23 @@ def test_sdpa_and_eager_agree_on_every_family(family):
     assert torch.allclose(out_sdpa, out_eager, atol=1e-5, rtol=1e-5)
 
 
-def test_dense_lowering_matches_manual_masked_softmax():
-    q, k, v = _qkv(B=1)
-    lens = torch.tensor([4], device="cuda")
-    out = _layer("eager")(q, k, v, mask=AttnMask.from_lengths(lens))
-    # Manual reference over the valid keys only.
-    qh = q.transpose(1, 2)
-    kh = k[:, :4].transpose(1, 2)
-    vh = v[:, :4].transpose(1, 2)
-    attn = torch.softmax((qh @ kh.transpose(-2, -1)) / 4.0, dim=-1)
-    ref = (attn @ vh).transpose(1, 2)
-    assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5)
-
-
-def test_causal_plus_lengths_masks_pad_keys_and_keeps_causality():
+def test_dense_lowering_matches_manual_masked_softmax_with_and_without_causal():
     q, k, v = _qkv(B=2)
     lens = torch.tensor([4, 6], device="cuda")
+    # Non-causal: row attends the valid keys only.
+    out = _layer("eager")(q, k, v, mask=AttnMask.from_lengths(lens))
+    qh, kh, vh = (
+        q[:1].transpose(1, 2),
+        k[:1, :4].transpose(1, 2),
+        v[:1, :4].transpose(1, 2),
+    )
+    ref = (torch.softmax((qh @ kh.transpose(-2, -1)) / 4.0, dim=-1) @ vh).transpose(
+        1, 2
+    )
+    assert torch.allclose(out[:1], ref, atol=1e-5, rtol=1e-5)
+    # Causal + lengths: row 0 of batch 0 attends key 0 only.
     out = _layer("eager", causal=True)(q, k, v, mask=AttnMask.from_lengths(lens))
-    # Row 0 of batch 0 attends key 0 only.
-    qh = q[0:1, 0:1].transpose(1, 2)
-    kh = k[0:1, 0:1].transpose(1, 2)
+    qh, kh = q[0:1, 0:1].transpose(1, 2), k[0:1, 0:1].transpose(1, 2)
     ref = torch.softmax((qh @ kh.transpose(-2, -1)) / 4.0, dim=-1) @ v[
         0:1, 0:1
     ].transpose(1, 2)

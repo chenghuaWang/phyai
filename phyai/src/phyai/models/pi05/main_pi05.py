@@ -11,7 +11,7 @@ Two pieces, both consumed by :class:`~phyai.engine.Engine`:
   parses the checkpoint folder's ``config.json`` via
   :func:`phyai.utils.load_config`, builds a :class:`PI05Model`,
   runs :func:`load_pretrained`, constructs and warms a
-  :class:`PI05WS1Scheduler`, then forwards :meth:`step` to it.
+  :class:`PI05Scheduler`, then forwards :meth:`step` to it.
 
 Importing this module registers ``PI05Entry`` with the engine via
 ``@Engine.register`` at class-definition time. The engine's own
@@ -40,9 +40,9 @@ from phyai.engine_config import get_engine_config
 from phyai.layers.quant.active import load_quant_plan, use_quant_plan
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.modeling_pi05 import PI05Model
-from phyai.models.pi05.scheduler_ws1_pi05 import (
+from phyai.models.pi05.scheduler_pi05 import (
     PI05Request,
-    PI05WS1Scheduler,
+    PI05Scheduler,
 )
 from phyai.utils import get_logger, load_config
 from phyai.weights import load_pretrained
@@ -152,7 +152,7 @@ class PI05Entry(Entry):
         # Default-init the slots so :meth:`step` / :meth:`close` can
         # check for "setup not yet run" without an attr-exists guard.
         self.model: PI05Model | None = None
-        self.scheduler: PI05WS1Scheduler | None = None
+        self.scheduler: PI05Scheduler | None = None
 
     def setup(self, args: PI05Args) -> None:  # type: ignore[override]
         """Build model, load weights, construct + warm the scheduler."""
@@ -183,7 +183,7 @@ class PI05Entry(Entry):
 
         num_images = self._resolve_num_images(args.inputs_image_shape, config)
 
-        self.scheduler = PI05WS1Scheduler(
+        self.scheduler = PI05Scheduler(
             self.model,
             max_batch_size=args.max_batch_size,
             num_images=num_images,

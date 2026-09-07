@@ -1,9 +1,9 @@
 """Linear layer integration tests.
 
-Most tests run at ws=1 via a mocked Mesh. The parallel ops bail out without
-communication, so we can exercise layer construction, weight allocation, and
-forward() on CUDA. A couple of multi-rank tests spin up gloo workers (CPU
-collectives by design) to verify the collective glue at ws>1.
+Most tests run at ws=1 via the shared ``fake_mesh`` fixture. The parallel ops
+bail out without communication, so we can exercise layer construction, weight
+allocation, and forward() on CUDA. One multi-rank test spins up gloo workers
+(CPU collectives by design) to verify the collective glue at ws>1.
 """
 
 from __future__ import annotations
@@ -27,113 +27,91 @@ import phyai.layers.linear as L
 # ---------------------------------------------------------------------------
 
 
-def test_replicated_linear_bf16_matches_F_linear(fake_mesh):
-    fake_mesh(name="model")
+def test_replicated_linear_matches_F_linear_and_can_defer_its_bias(fake_mesh):
+    fake_mesh()
     layer = L.ReplicatedLinear(
-        in_features=32,
-        out_features=16,
-        bias=True,
-        params_dtype=torch.bfloat16,
+        in_features=32, out_features=16, bias=True, params_dtype=torch.bfloat16
     )
     nn.init.normal_(layer.weight, std=0.05)
     nn.init.normal_(layer.bias, std=0.05)
-
     x = torch.randn(4, 32, dtype=torch.bfloat16, device="cuda")
     y, bias_out = layer(x)
     assert bias_out is None
-    ref = F.linear(x, layer.weight, layer.bias)
-    torch.testing.assert_close(y, ref, atol=0, rtol=0)
+    torch.testing.assert_close(y, F.linear(x, layer.weight, layer.bias), atol=0, rtol=0)
 
-
-def test_replicated_linear_skip_bias_add_returns_bias(fake_mesh):
-    fake_mesh()
-    layer = L.ReplicatedLinear(
-        in_features=16,
-        out_features=8,
+    # skip_bias_add hands the bias back instead of adding it.
+    deferred = L.ReplicatedLinear(
+        in_features=32,
+        out_features=16,
         bias=True,
         skip_bias_add=True,
         params_dtype=torch.bfloat16,
     )
-    nn.init.normal_(layer.weight, std=0.05)
-    nn.init.normal_(layer.bias, std=0.05)
-
-    x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-    y, bias_out = layer(x)
-    assert bias_out is layer.bias
-    # y should NOT include bias (skip_bias_add=True).
-    ref = F.linear(x, layer.weight, None)
-    torch.testing.assert_close(y, ref, atol=0, rtol=0)
+    deferred.weight.data.copy_(layer.weight.data)
+    deferred.bias.data.copy_(layer.bias.data)
+    y, bias_out = deferred(x)
+    assert bias_out is deferred.bias
+    torch.testing.assert_close(y, F.linear(x, layer.weight), atol=0, rtol=0)
 
 
-def test_column_parallel_ws1_matches_F_linear(fake_mesh):
-    fake_mesh(sizes={"tp": 1})
-    layer = L.ColumnParallelLinear(
+def test_column_and_row_parallel_match_F_linear_at_ws1(fake_mesh):
+    fake_mesh(tp_size=1)
+    col = L.ColumnParallelLinear(
         in_features=32,
         out_features=16,
-        axis="tp",
+        group="dense_tp",
         bias=False,
         params_dtype=torch.bfloat16,
     )
-    nn.init.normal_(layer.weight, std=0.05)
-
+    row = L.RowParallelLinear(
+        in_features=32,
+        out_features=16,
+        group="dense_tp",
+        bias=False,
+        params_dtype=torch.bfloat16,
+    )
+    nn.init.normal_(col.weight, std=0.05)
+    nn.init.normal_(row.weight, std=0.05)
     x = torch.randn(5, 32, dtype=torch.bfloat16, device="cuda")
-    y, _ = layer(x)
-    ref = F.linear(x, layer.weight)
-    torch.testing.assert_close(y, ref, atol=0, rtol=0)
-    # With ws=1 and gather_output default False, shape is the per-rank output.
-    assert y.shape == (5, 16)
 
+    y, _ = col(x)
+    assert y.shape == (5, 16)  # ws=1: the per-rank output is the whole output
+    torch.testing.assert_close(y, F.linear(x, col.weight), atol=0, rtol=0)
+    y, _ = row(x)
+    torch.testing.assert_close(y, F.linear(x, row.weight), atol=0, rtol=0)
 
-def test_column_parallel_rejects_indivisible_split(fake_mesh):
-    fake_mesh(sizes={"tp": 4})
-    with pytest.raises(ValueError, match="not divisible"):
-        L.ColumnParallelLinear(
-            in_features=8,
-            out_features=30,  # 30 % 4 != 0
-            axis="tp",
-            bias=False,
-        )
-
-
-def test_row_parallel_ws1_matches_F_linear(fake_mesh):
-    fake_mesh(sizes={"tp": 1})
-    layer = L.RowParallelLinear(
-        in_features=32,
-        out_features=16,
-        axis="tp",
-        bias=False,
-        params_dtype=torch.bfloat16,
-    )
-    nn.init.normal_(layer.weight, std=0.05)
-
-    x = torch.randn(3, 32, dtype=torch.bfloat16, device="cuda")
-    y, _ = layer(x)
-    ref = F.linear(x, layer.weight)
-    torch.testing.assert_close(y, ref, atol=0, rtol=0)
-
-
-def test_row_parallel_bias_only_on_rank0(fake_mesh):
-    """At ws=1 the bias IS added (rank==0)."""
-    fake_mesh(sizes={"tp": 1})
-    layer = L.RowParallelLinear(
+    # Row-parallel adds its bias on rank 0 only; at ws=1 that is this rank.
+    biased = L.RowParallelLinear(
         in_features=16,
         out_features=8,
-        axis="tp",
+        group="dense_tp",
         bias=True,
         params_dtype=torch.bfloat16,
     )
-    layer.weight.data.zero_()
-    layer.bias.data.fill_(3.0)
-
-    x = torch.zeros(2, 16, dtype=torch.bfloat16, device="cuda")
-    y, _ = layer(x)
+    biased.weight.data.zero_()
+    biased.bias.data.fill_(3.0)
+    y, _ = biased(torch.zeros(2, 16, dtype=torch.bfloat16, device="cuda"))
     assert torch.all(y == 3.0)
 
 
-def test_row_parallel_rejects_indivisible_in(fake_mesh):
-    fake_mesh(sizes={"tp": 4})
+def test_construction_rejects_indivisible_shards(fake_mesh):
+    fake_mesh(tp_size=4)
     with pytest.raises(ValueError, match="not divisible"):
-        L.RowParallelLinear(in_features=30, out_features=16, axis="tp")
+        L.ColumnParallelLinear(
+            in_features=8, out_features=30, group="dense_tp", bias=False
+        )
+    with pytest.raises(ValueError, match="not divisible"):
+        L.RowParallelLinear(in_features=30, out_features=16, group="dense_tp")
+    fake_mesh(tp_size=3)
+    with pytest.raises(ValueError, match="multiple of num_kv_heads"):
+        L.QKVParallelLinear(
+            hidden_size=32,
+            head_dim=8,
+            num_heads=6,
+            num_kv_heads=2,
+            group="dense_tp",
+            bias=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -141,27 +119,12 @@ def test_row_parallel_rejects_indivisible_in(fake_mesh):
 # ---------------------------------------------------------------------------
 
 
-def test_merged_column_construct_fused_weight(fake_mesh):
-    fake_mesh(sizes={"tp": 1})
-    layer = L.MergedColumnParallelLinear(
-        in_features=32,
-        output_sizes=[16, 16],  # gate/up style
-        axis="tp",
-        bias=False,
-        params_dtype=torch.bfloat16,
-    )
-    # Weight is fused: (gate_size + up_size, in)
-    assert layer.weight.shape == (32, 32)
-    assert layer.output_partition_sizes == [16, 16]
-    assert layer.output_sizes_global == [16, 16]
-
-
 def test_merged_column_attaches_two_legs(fake_mesh):
-    fake_mesh(sizes={"tp": 2})
+    fake_mesh(tp_size=2)
     layer = L.MergedColumnParallelLinear(
         in_features=16,
         output_sizes=[16, 16],
-        axis="tp",
+        group="dense_tp",
         bias=False,
         params_dtype=torch.bfloat16,
         prefix="model.layers.0.mlp.gate_up_proj",
@@ -187,11 +150,11 @@ def test_merged_column_attaches_two_legs(fake_mesh):
 
 
 def test_merged_column_attaches_with_custom_hf_legs(fake_mesh):
-    fake_mesh(sizes={"tp": 1})
+    fake_mesh(tp_size=1)
     layer = L.MergedColumnParallelLinear(
         in_features=16,
         output_sizes=[8, 8],
-        axis="tp",
+        group="dense_tp",
         bias=False,
         hf_legs=("w_gate", "w_up"),
         prefix="block.mlp.w12",
@@ -207,63 +170,45 @@ def test_merged_column_attaches_with_custom_hf_legs(fake_mesh):
 # ---------------------------------------------------------------------------
 
 
-def test_qkv_linear_no_gqa_shapes(fake_mesh):
-    fake_mesh(sizes={"tp": 1})
-    layer = L.QKVParallelLinear(
-        hidden_size=32,
-        head_dim=8,
-        num_heads=4,
-        num_kv_heads=4,
-        axis="tp",
-        bias=False,
-        params_dtype=torch.bfloat16,
+def test_attention_and_dense_weights_use_their_own_group_ranks(fake_mesh):
+    from phyai.engine_config import (
+        AttentionParallelConfig,
+        DenseParallelConfig,
+        ParallelConfig,
     )
-    # out = q (4*8) + k (4*8) + v (4*8) = 96
-    assert layer.weight.shape == (96, 32)
-    assert layer.num_kv_replicas == 1
+    from phyai.parallel.mesh import Mesh
+    from phyai.parallel.state import register_mesh
+    from phyai.parallel.layout import build_rank_layout
 
-
-def test_qkv_linear_gqa_replicates_kv(fake_mesh):
-    """tp_size=4 with 2 KV heads -> each rank gets the whole KV replicated twice."""
-    fake_mesh(sizes={"tp": 4})
-    layer = L.QKVParallelLinear(
-        hidden_size=32,
-        head_dim=8,
-        num_heads=8,
-        num_kv_heads=2,
-        axis="tp",
-        bias=False,
-        params_dtype=torch.bfloat16,
-    )
-    # Effective kv_heads = tp_size (2 kv heads replicated 4//2=2 times).
-    # q_size = 8 * 8 = 64, kv_size = 4 * 8 = 32.
-    # per-rank: q = 64/4 = 16, kv = 32/4 = 8 each.
-    assert layer.num_kv_replicas == 2
-    assert layer.output_partition_sizes == [16, 8, 8]
-    assert layer.weight.shape == (32, 32)
-
-
-def test_qkv_linear_rejects_nonmultiple_tp(fake_mesh):
-    fake_mesh(sizes={"tp": 3})
-    with pytest.raises(ValueError, match="multiple of num_kv_heads"):
-        L.QKVParallelLinear(
-            hidden_size=32,
-            head_dim=8,
-            num_heads=6,
-            num_kv_heads=2,
-            axis="tp",
-            bias=False,
+    fake_mesh()
+    layout = build_rank_layout(
+        ParallelConfig(
+            dense=DenseParallelConfig(tp_size=4),
+            attention=AttentionParallelConfig(dp_size=2),
         )
+    )
+    register_mesh(Mesh(layout, rank=2))
+    qkv = L.QKVParallelLinear(
+        32, 8, 4, prefix="attn.qkv_proj", params_dtype=torch.float32
+    )
+    dense = L.ColumnParallelLinear(32, 32, prefix="mlp.fc", params_dtype=torch.float32)
+    assert (qkv.tp_size, qkv.tp_rank) == (2, 0)
+    assert (dense.tp_size, dense.tp_rank) == (4, 2)
+    weight = torch.arange(32 * 32, dtype=torch.float32).reshape(32, 32)
+    qkv.weight.weight_loader(qkv.weight, weight, "q")
+    dense.weight.weight_loader(dense.weight, weight, None)
+    torch.testing.assert_close(qkv.weight[:16].cpu(), weight[:16])
+    torch.testing.assert_close(dense.weight.cpu(), weight[16:24])
 
 
 def test_qkv_linear_attaches_q_k_v_legs(fake_mesh):
-    fake_mesh(sizes={"tp": 1})
+    fake_mesh(tp_size=1)
     layer = L.QKVParallelLinear(
         hidden_size=16,
         head_dim=4,
         num_heads=2,
         num_kv_heads=2,
-        axis="tp",
+        group="dense_tp",
         bias=False,
         params_dtype=torch.bfloat16,
         prefix="model.layers.0.self_attn.qkv_proj",
@@ -288,13 +233,13 @@ def test_qkv_linear_attaches_q_k_v_legs(fake_mesh):
 
 
 def test_qkv_linear_attaches_with_custom_hf_legs(fake_mesh):
-    fake_mesh(sizes={"tp": 1})
+    fake_mesh(tp_size=1)
     layer = L.QKVParallelLinear(
         hidden_size=16,
         head_dim=4,
         num_heads=2,
         num_kv_heads=2,
-        axis="tp",
+        group="dense_tp",
         bias=False,
         hf_legs={"q": "query", "k": "key", "v": "value"},
         prefix="block.attn.qkv_proj",
@@ -306,40 +251,39 @@ def test_qkv_linear_attaches_with_custom_hf_legs(fake_mesh):
     ]
 
 
-def test_qkv_gqa_replica_share_kv_slot(fake_mesh):
-    """tp=4 with 2 KV heads: ranks 0/1 share K/V slot 0; ranks 2/3 share slot 1."""
-    fake_mesh(sizes={"tp": 4}, ranks={"tp": 0})
-    # Build a fake K source with row patterns we can identify after sharding.
-    # effective_kv_heads = 4 (tp_size), kv_size_global = 4*8 = 32 rows total.
-    # Per-rank kv_local = 32 / 4 = 8 rows.
-    # num_kv_replicas = 4//2 = 2 -> kv_world = 4/2 = 2 -> kv_per_slot = 32/2 = 16.
-    # rank 0/1 -> slot 0 -> rows 0..16 (each takes 8 of those 16).
-    # Wait, the loader narrow uses size=kv_local=8 but rank=tp_rank//2.
-    # rank0/1: slot=0, narrow(0, 0*8, 8) -> rows 0..8.
-    # rank2/3: slot=1, narrow(0, 1*8, 8) -> rows 8..16.
-    # So both ranks at slot 0 read the SAME rows 0..8.
+def test_qkv_gqa_replicas_share_kv_rows(fake_mesh):
+    """tp=4 with 2 KV heads: each KV head is replicated on two ranks.
+
+    effective_kv_heads = tp_size = 4, so the fused weight is q (64/4=16 rows)
+    + k (8) + v (8) per rank. The K/V legs shard with replication_factor 2:
+    ranks 0/1 read slot 0 (rows 0..8 of the source), ranks 2/3 read slot 1.
+    """
+    fake_mesh(tp_size=4, rank=0)
     layer_r0 = L.QKVParallelLinear(
         hidden_size=32,
         head_dim=8,
         num_heads=8,
         num_kv_heads=2,
-        axis="tp",
+        group="dense_tp",
         bias=False,
         prefix="block.qkv_proj",
         params_dtype=torch.float32,
     )
+    assert layer_r0.num_kv_replicas == 2
+    assert layer_r0.output_partition_sizes == [16, 8, 8]
+    assert layer_r0.weight.shape == (32, 32)
     disk_k = torch.arange(32 * 32, dtype=torch.float32).reshape(32, 32)
     layer_r0.weight.weight_loader(layer_r0.weight, disk_k, "k")
     # Q legs are 16 rows (offset 0); K leg goes to offset 16, size 8.
     k_at_r0 = layer_r0.weight.data.narrow(0, 16, 8).clone()
 
-    fake_mesh(sizes={"tp": 4}, ranks={"tp": 1})
+    fake_mesh(tp_size=4, rank=1)
     layer_r1 = L.QKVParallelLinear(
         hidden_size=32,
         head_dim=8,
         num_heads=8,
         num_kv_heads=2,
-        axis="tp",
+        group="dense_tp",
         bias=False,
         prefix="block.qkv_proj",
         params_dtype=torch.float32,
@@ -349,13 +293,13 @@ def test_qkv_gqa_replica_share_kv_slot(fake_mesh):
     # Ranks 0 and 1 share slot 0 -> same K rows.
     torch.testing.assert_close(k_at_r0, k_at_r1)
 
-    fake_mesh(sizes={"tp": 4}, ranks={"tp": 2})
+    fake_mesh(tp_size=4, rank=2)
     layer_r2 = L.QKVParallelLinear(
         hidden_size=32,
         head_dim=8,
         num_heads=8,
         num_kv_heads=2,
-        axis="tp",
+        group="dense_tp",
         bias=False,
         prefix="block.qkv_proj",
         params_dtype=torch.float32,
@@ -371,13 +315,44 @@ def test_qkv_gqa_replica_share_kv_slot(fake_mesh):
 # ---------------------------------------------------------------------------
 
 
-def test_replicated_linear_attaches(fake_mesh):
+def test_loaders_shard_by_group_rank_and_skip_unprefixed_params(fake_mesh):
+    fake_mesh(tp_size=2, rank=1)
+    col = L.ColumnParallelLinear(
+        in_features=16,
+        out_features=32,
+        group="dense_tp",
+        bias=False,
+        prefix="block.fc",
+        params_dtype=torch.float32,
+    )
+    assert col.weight.hf_keys == [("block.fc.weight", None)]
+    disk = torch.arange(32 * 16, dtype=torch.float32).reshape(32, 16)
+    col.weight.weight_loader(col.weight, disk, None)
+    torch.testing.assert_close(col.weight.data.cpu(), disk.narrow(0, 16, 16))
+
+    fake_mesh(tp_size=4, rank=2)
+    row = L.RowParallelLinear(
+        in_features=64,
+        out_features=16,
+        group="dense_tp",
+        bias=True,
+        prefix="block.out_proj",
+        params_dtype=torch.float32,
+    )
+    assert row.weight.hf_keys == [("block.out_proj.weight", None)]
+    assert row.bias.hf_keys == [("block.out_proj.bias", None)]  # bias is replicated
+    disk_w = torch.arange(16 * 64, dtype=torch.float32).reshape(16, 64)
+    row.weight.weight_loader(row.weight, disk_w, None)
+    torch.testing.assert_close(row.weight.data.cpu(), disk_w.narrow(1, 32, 16))
+
     fake_mesh()
-    layer = L.ReplicatedLinear(
+    plain = L.ReplicatedLinear(
         in_features=4, out_features=8, bias=True, prefix="block.fc"
     )
-    assert layer.weight.hf_keys == [("block.fc.weight", None)]
-    assert layer.bias.hf_keys == [("block.fc.bias", None)]
+    assert plain.weight.hf_keys == [("block.fc.weight", None)]
+    assert plain.bias.hf_keys == [("block.fc.bias", None)]
+    # No prefix -> no hf_keys attached -> the loader skips this param.
+    assert not hasattr(L.ReplicatedLinear(4, 8, prefix="").weight, "hf_keys")
 
 
 def test_replicated_linear_nvfp4_loader_quantizes_bf16_weight(fake_mesh):
@@ -397,50 +372,6 @@ def test_replicated_linear_nvfp4_loader_quantizes_bf16_weight(fake_mesh):
     assert layer.weight.shape == (8, 8)
     assert layer.weight.dtype == torch.uint8
     assert layer._nvfp4_pending_weight is None
-
-
-def test_column_parallel_attaches_tp2_rank1(fake_mesh):
-    fake_mesh(sizes={"tp": 2}, ranks={"tp": 1})
-    layer = L.ColumnParallelLinear(
-        in_features=16,
-        out_features=32,
-        axis="tp",
-        bias=False,
-        prefix="block.fc",
-        params_dtype=torch.float32,
-    )
-    assert layer.weight.hf_keys == [("block.fc.weight", None)]
-    # Apply: source has 32 rows; rank 1 writes rows 16..32 of source into local 16-row tensor.
-    disk = torch.arange(32 * 16, dtype=torch.float32).reshape(32, 16)
-    layer.weight.weight_loader(layer.weight, disk, None)
-    torch.testing.assert_close(layer.weight.data.cpu(), disk.narrow(0, 16, 16))
-
-
-def test_row_parallel_attaches_dim1_shard(fake_mesh):
-    fake_mesh(sizes={"tp": 4}, ranks={"tp": 2})
-    layer = L.RowParallelLinear(
-        in_features=64,
-        out_features=16,
-        axis="tp",
-        bias=True,
-        prefix="block.out_proj",
-        params_dtype=torch.float32,
-    )
-    assert layer.weight.hf_keys == [("block.out_proj.weight", None)]
-    # Bias replicated (full copy, no shard).
-    assert layer.bias.hf_keys == [("block.out_proj.bias", None)]
-
-    disk_w = torch.arange(16 * 64, dtype=torch.float32).reshape(16, 64)
-    layer.weight.weight_loader(layer.weight, disk_w, None)
-    # Rank 2 takes columns [32:48) along input dim.
-    torch.testing.assert_close(layer.weight.data.cpu(), disk_w.narrow(1, 32, 16))
-
-
-def test_empty_prefix_skips_attach(fake_mesh):
-    fake_mesh()
-    layer = L.ReplicatedLinear(in_features=4, out_features=8, prefix="")
-    # No prefix -> no hf_keys attached -> loader skips this param.
-    assert not hasattr(layer.weight, "hf_keys")
 
 
 # ---------------------------------------------------------------------------
@@ -494,21 +425,12 @@ def bf16_gemm_query(*, role: str = "", M: int = 1024):
     )
 
 
-def test_a_policy_rule_narrows_selection_to_one_backend(fake_mesh, tmp_path):
-    """What ``PHYAI_FORCE_LINEAR_KERNEL=torch`` used to do, in YAML."""
-
-    fake_mesh()
-    path = policy_narrowing_gemm_to(tmp_path, "torch.gemm.*")
-    selector = selector_for(path, "nvidia:SM100")
-    # FlashInfer would otherwise win on priority for a prefill-sized bf16 call.
-    assert selector.explain(bf16_gemm_query()).selected == "torch.gemm.bf16"
-
-
 def test_a_policy_rule_can_narrow_one_role_and_leave_the_rest(fake_mesh, tmp_path):
-    """The thing the deleted global setting could not do.
+    """A rule can move one role onto torch while every other role stays put.
 
-    It moved *every* linear onto torch. An A/B almost always wants one role —
-    everything else has to stay put, or the measurement means nothing.
+    The deleted ``PHYAI_FORCE_LINEAR_KERNEL`` setting could only move *every*
+    linear; an A/B almost always wants one role, or the measurement means
+    nothing.
     """
 
     fake_mesh()
@@ -641,19 +563,24 @@ def _run_gloo(test_fn, *, world_size: int, timeout_s: float = 30.0) -> None:
 
 
 def _w_column_tp2_column_row_equiv(rank, world_size):
-    """Column-then-Row at tp=2 should produce correct per-rank outputs.
+    """Column-then-Row at tp=2 must reproduce the un-sharded reference.
 
-    We disable the final all_reduce (``reduce_results=False``) because the
-    collective layer has a pre-existing torch 2.10 compatibility issue
-    that is orthogonal to the Linear tests. Summing the per-rank partials
-    across ranks (done in the parent via ``err_queue``) reproduces the
-    un-sharded F.linear ∘ F.linear reference.
+    ``reduce_results=True`` exercises the layer's exit all_reduce on the tp
+    group (gloo here), so the row output on every rank equals the full
+    F.linear ∘ F.linear result.
     """
     import phyai.parallel as P
     import phyai.layers.linear as L
 
     torch.manual_seed(0)
-    P.init(layout=(world_size,), mesh_dim_names=("tp",), device="cpu", backend="gloo")
+    from phyai.engine_config import ParallelConfig, DenseParallelConfig
+
+    P.init(
+        ParallelConfig(dense=DenseParallelConfig(tp_size=world_size)),
+        device="cpu",
+        backend="gloo",
+        enable_pynccl=False,
+    )
 
     hidden = 16
     inter = 32
@@ -664,7 +591,7 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
     col = L.ColumnParallelLinear(
         in_features=hidden,
         out_features=inter,
-        axis="tp",
+        group="dense_tp",
         bias=False,
         params_dtype=torch.float32,
         device="cpu",
@@ -673,9 +600,9 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
     row = L.RowParallelLinear(
         in_features=inter,
         out_features=hidden,
-        axis="tp",
+        group="dense_tp",
         bias=False,
-        reduce_results=False,
+        reduce_results=True,
         params_dtype=torch.float32,
         device="cpu",
         prefix="row",
@@ -694,18 +621,12 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
     expected_col = F.linear(x, W1[start:end, :])
     torch.testing.assert_close(y_col, expected_col, atol=1e-6, rtol=1e-6)
 
-    # Row forward without reduce returns per-rank partial sum.
-    y_row_partial, _ = row(y_col)
-    assert y_row_partial.shape == (4, hidden)
-    # Each rank's partial = y_col @ W2_this_rank_cols.T using W2 row-sliced.
-    W2_rank = W2[:, start:end]
-    expected_partial = F.linear(y_col, W2_rank)
-    torch.testing.assert_close(
-        y_row_partial,
-        expected_partial,
-        atol=1e-6,
-        rtol=1e-6,
-    )
+    # Row forward all-reduces the per-rank partials: every rank now holds
+    # the full x @ W1.T @ W2.T.
+    y_row, _ = row(y_col)
+    assert y_row.shape == (4, hidden)
+    expected = F.linear(F.linear(x, W1), W2)
+    torch.testing.assert_close(y_row, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_column_then_row_tp2_numerical_equivalence():

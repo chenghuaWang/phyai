@@ -8,6 +8,6 @@ rules:
     match:
       op: attention_paged
       role: expert
-      model.family: [pi05, pi05_wn]
+      model.family: pi05
       device.arch: sm90
     restrict_to: "flashinfer.attention_paged.fa2"

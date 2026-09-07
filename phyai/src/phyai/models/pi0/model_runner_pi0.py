@@ -12,7 +12,7 @@ import torch
 
 from phyai.cache import KVCachePool
 from phyai.utils import get_logger
-from phyai.payload import LLMForwardBatch, VisionForwardBatch
+from phyai.models.pi0.forward_batch_pi0 import LLMForwardBatch, VisionForwardBatch
 from phyai.layers.attention import (
     AttnMode,
     AttnLayout,

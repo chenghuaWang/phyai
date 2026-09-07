@@ -1,4 +1,4 @@
-"""Cosmos3 generation plugin entry — the engine's cosmos3 hook."""
+"""Cosmos3 generation plugin entry."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import ClassVar
 import torch
 
 from phyai.engine import Engine, Entry, EntryArgs
-from phyai.engine_config import get_engine_config
+from phyai.engine_config import ParallelConfig, get_engine_config
 from phyai.layers.quant.active import load_quant_plan, use_quant_plan
 from phyai.models.cosmos3.avae_sound import (
     Cosmos3AVAESoundDecoder,
@@ -24,11 +24,10 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
     Cosmos3Transformer,
     cosmos3_weight_remap,
 )
+from phyai.models.cosmos3.parallel_cosmos3 import validate_cosmos3_parallel
+from phyai.models.cosmos3.requests_cosmos3 import Cosmos3T2VRequest
 from phyai.models.cosmos3.sampler_unipc import resolve_use_karras_sigmas
-from phyai.models.cosmos3.scheduler_ws1_cosmos3 import (
-    Cosmos3T2VRequest,
-    Cosmos3T2VScheduler,
-)
+from phyai.models.cosmos3.scheduler_cosmos3 import Cosmos3T2VScheduler
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
 from phyai.utils import get_logger, load_config
 from phyai.weights import load_pretrained
@@ -68,6 +67,17 @@ class Cosmos3Entry(Entry):
 
     name: ClassVar[str] = "cosmos3"
     args_cls: ClassVar[type[EntryArgs]] = Cosmos3Args
+
+    parallel_domains: ClassVar[frozenset[str]] = frozenset(
+        {"cfg", "dense", "attention"}
+    )
+
+    @classmethod
+    def validate_parallel(
+        cls, parallel: ParallelConfig, replica_world_size: int | None = None
+    ) -> None:
+        super().validate_parallel(parallel, replica_world_size)
+        validate_cosmos3_parallel(parallel, replica_world_size)
 
     def __init__(self) -> None:
         # Default-init the slots so :meth:`step` / :meth:`close` /

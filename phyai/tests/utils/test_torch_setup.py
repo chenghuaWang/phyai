@@ -1,4 +1,4 @@
-"""Unit tests for phyai.utils.torch_setup — process-wide torch state.
+"""Unit tests for phyai.utils.torch_setup, process-wide torch state.
 
 Every test restores what it changed: these are process globals, and a leak
 would silently reconfigure the rest of the suite.
@@ -13,12 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from phyai.utils.torch_setup import (
-    disable_grad,
-    init_seed,
-    init_threads,
-    local_rank,
-)
+from phyai.utils.torch_setup import disable_grad, init_seed, init_threads, local_rank
 
 
 @pytest.fixture(autouse=True)
@@ -33,98 +28,49 @@ def _restore_torch_globals():
     os.environ.update(saved_env)
 
 
-# --------------------------------------------------------------------------- #
-# init_threads                                                                #
-# --------------------------------------------------------------------------- #
-
-
-def test_cpu_target_is_left_alone():
+def test_init_threads_pins_accelerators_to_one_thread_and_leaves_cpu_alone():
     """On a CPU target the intra-op pool IS the compute; do not shrink it."""
     before = torch.get_num_threads()
-    assert init_threads(device_type="cpu") == before
-    assert torch.get_num_threads() == before
-
-
-def test_accelerator_target_defaults_to_one_thread():
-    assert init_threads(device_type="cuda") == 1
-    assert torch.get_num_threads() == 1
-
-
-def test_explicit_count_overrides_the_auto_choice():
+    assert init_threads(device_type="cpu") == before == torch.get_num_threads()
+    assert init_threads(device_type="cuda") == 1 == torch.get_num_threads()
     assert init_threads(device_type="cuda", num_threads=3) == 3
     assert init_threads(device_type="cpu", num_threads=2) == 2
-
-
-def test_explicit_count_must_be_positive():
     with pytest.raises(ValueError, match="num_threads"):
         init_threads(device_type="cuda", num_threads=0)
 
 
-# --------------------------------------------------------------------------- #
-# init_seed                                                                   #
-# --------------------------------------------------------------------------- #
-
-
-def test_none_seed_is_a_no_op():
+def test_init_seed_covers_the_three_global_rngs_and_nothing_else():
+    """``None`` is a no-op; a seed makes random/numpy/torch reproducible; model
+    code owning a RandomState (the cosmos3 samplers' per-request noise) must be
+    immune to process seeding."""
     torch.manual_seed(1234)
     expected = torch.rand(4)
     torch.manual_seed(1234)
     init_seed(None)
     assert torch.equal(torch.rand(4), expected)
 
-
-def test_seed_makes_all_three_global_rngs_reproducible():
     init_seed(7)
     first = (random.random(), float(np.random.rand()), float(torch.rand(1)))
     init_seed(7)
-    second = (random.random(), float(np.random.rand()), float(torch.rand(1)))
-    assert first == second
+    assert (random.random(), float(np.random.rand()), float(torch.rand(1))) == first
 
-
-def test_seed_does_not_touch_generator_local_rng():
-    """Model code owning a RandomState must be immune to process seeding.
-
-    The cosmos3 samplers rely on this: their per-request
-    ``np.random.RandomState(seed)`` noise has to be bit-identical whatever
-    else the process did.
-    """
-    expected = np.random.RandomState(99).rand(4)
+    local = np.random.RandomState(99).rand(4)
     init_seed(12345)
-    assert np.array_equal(np.random.RandomState(99).rand(4), expected)
+    assert np.array_equal(np.random.RandomState(99).rand(4), local)
 
 
-# --------------------------------------------------------------------------- #
-# disable_grad                                                                #
-# --------------------------------------------------------------------------- #
-
-
-def test_disable_grad_turns_autograd_off():
+def test_disable_grad_turns_autograd_off_idempotently():
     torch.set_grad_enabled(True)
     disable_grad()
     assert not torch.is_grad_enabled()
-
-
-def test_disable_grad_is_idempotent():
-    torch.set_grad_enabled(False)
     disable_grad()
     assert not torch.is_grad_enabled()
 
 
-# --------------------------------------------------------------------------- #
-# local_rank                                                                  #
-# --------------------------------------------------------------------------- #
-
-
-def test_local_rank_reads_launcher_env():
+def test_local_rank_reads_the_launcher_env_and_falls_back_to_zero():
     os.environ["LOCAL_RANK"] = "3"
     assert local_rank() == 3
-
-
-def test_local_rank_defaults_to_zero_without_launcher():
-    os.environ.pop("LOCAL_RANK", None)
-    assert local_rank() == 0
-
-
-def test_local_rank_falls_back_on_garbage():
     os.environ["LOCAL_RANK"] = "not-an-int"
+    assert local_rank() == 0
+    os.environ.pop("LOCAL_RANK")
     assert local_rank() == 0

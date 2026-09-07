@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import re
 from threading import Lock
-from dataclasses import field, replace, dataclass
+from dataclasses import dataclass, field, replace
 
 import torch
 
 from phyai.env import envs, removed_env_vars_in_use
 from phyai.kernel.config import KernelConfig
+from phyai.parallel.config import (
+    AttentionParallelConfig,
+    DenseParallelConfig,
+    MoeParallelConfig,
+    OuterParallelConfig,
+    ParallelConfig,
+    ResolvedParallelConfig,
+)
 
 
 def _canonical_backend_name(name: str) -> str:
@@ -80,39 +88,6 @@ class DeviceConfig:
                 f"DeviceConfig.params_dtype must be a torch.dtype, got "
                 f"{type(self.params_dtype).__name__}."
             )
-
-
-@dataclass(frozen=True)
-class ParallelConfig:
-    """Parallelism sizes used to build the engine process mesh.
-
-    ``world_size`` is independent of the axis sizes because parallel axes
-    can overlap. Unused axes remain at ``1``.
-    """
-
-    world_size: int = 1
-    dp_size: int = 1
-    cfg_size: int = 1
-    ep_size: int = 1
-    sp_size: int = 1
-    cp_size: int = 1
-    tp_size: int = 1
-
-    def __post_init__(self) -> None:
-        for name in (
-            "world_size",
-            "dp_size",
-            "cfg_size",
-            "ep_size",
-            "sp_size",
-            "cp_size",
-            "tp_size",
-        ):
-            v = getattr(self, name)
-            if not isinstance(v, int) or v < 1:
-                raise ValueError(
-                    f"ParallelConfig.{name} must be a positive int, got {v!r}."
-                )
 
 
 @dataclass(frozen=True)
@@ -211,7 +186,7 @@ class EngineConfig:
     device: DeviceConfig = field(default_factory=DeviceConfig)
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    # Keep this field last for positional-constructor compatibility.
+    # Keep the kernel policy after the process-level fields.
     kernel: KernelConfig = field(default_factory=KernelConfig)
 
     @classmethod
@@ -254,22 +229,6 @@ class EngineConfig:
         if (v := envs.PHYAI_PARAMS_DTYPE.get()) is not None:
             device_kw["params_dtype"] = v
 
-        parallel_kw: dict[str, object] = {}
-        if (v := envs.PHYAI_WORLD_SIZE.get()) is not None:
-            parallel_kw["world_size"] = v
-        if (v := envs.PHYAI_DP_SIZE.get()) is not None:
-            parallel_kw["dp_size"] = v
-        if (v := envs.PHYAI_CFG_SIZE.get()) is not None:
-            parallel_kw["cfg_size"] = v
-        if (v := envs.PHYAI_EP_SIZE.get()) is not None:
-            parallel_kw["ep_size"] = v
-        if (v := envs.PHYAI_SP_SIZE.get()) is not None:
-            parallel_kw["sp_size"] = v
-        if (v := envs.PHYAI_CP_SIZE.get()) is not None:
-            parallel_kw["cp_size"] = v
-        if (v := envs.PHYAI_TP_SIZE.get()) is not None:
-            parallel_kw["tp_size"] = v
-
         runtime_kw: dict[str, object] = {}
         if (v := envs.PHYAI_USE_CUDA_GRAPH.get()) is not None:
             runtime_kw["use_cuda_graph"] = v
@@ -304,9 +263,7 @@ class EngineConfig:
             else base.backends,
             kernel=replace(base.kernel, **kernel_kw) if kernel_kw else base.kernel,
             device=replace(base.device, **device_kw) if device_kw else base.device,
-            parallel=replace(base.parallel, **parallel_kw)
-            if parallel_kw
-            else base.parallel,
+            parallel=base.parallel,
             runtime=replace(base.runtime, **runtime_kw) if runtime_kw else base.runtime,
         )
 
@@ -373,9 +330,14 @@ def resolve_params_dtype(params_dtype: "torch.dtype | None") -> "torch.dtype":
 __all__ = [
     "BackendConfig",
     "DeviceConfig",
+    "AttentionParallelConfig",
+    "DenseParallelConfig",
     "EngineConfig",
     "KernelConfig",
+    "MoeParallelConfig",
+    "OuterParallelConfig",
     "ParallelConfig",
+    "ResolvedParallelConfig",
     "RuntimeConfig",
     "get_engine_config",
     "init_engine_config",

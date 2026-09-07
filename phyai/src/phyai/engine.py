@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import abc
+import os
 import time
+from concurrent.futures import Future
 from typing import Any, ClassVar, Generator
 from datetime import timedelta
 from contextlib import contextmanager
@@ -19,7 +21,11 @@ from phyai.utils.cuda import init_cuda, format_gib, init_cublas, available_memor
 from phyai.kernel.call import freeze_kernel_choices
 from phyai.layers.attention.utils import release_global_fi_workspaces
 from phyai.kernel.types import ModelContext
-from phyai.engine_config import EngineConfig, init_engine_config
+from phyai.engine_config import EngineConfig, ParallelConfig, init_engine_config
+from phyai.parallel.config import DOMAINS, MODEL_DOMAINS
+from phyai.parallel.layout import build_rank_layout
+from phyai.server.deployment import DeploymentConfig, build_dispatcher
+from phyai.server.lifecycle import EngineUnavailableError
 from phyai.parallel.dist import init_dist
 from phyai.utils.logging import configure_logging
 from phyai.utils.env_setup import init_env, set_ulimit, init_process_debug
@@ -32,6 +38,25 @@ from phyai.runtime.tensor_dump import (
 )
 
 logger = get_logger(__name__)
+
+
+def _runtime_replica_world_size(parallel: ParallelConfig) -> int:
+    """Return the physical rank pool for this process or launcher."""
+    launcher_world = os.environ.get("WORLD_SIZE")
+    if dist.is_initialized():
+        actual = dist.get_world_size()
+        if launcher_world is not None and int(launcher_world) != actual:
+            raise ValueError("WORLD_SIZE does not match the initialized process group.")
+        return actual
+    if launcher_world is None:
+        return parallel.infer_replica_world_size()
+    try:
+        world = int(launcher_world)
+    except ValueError as error:
+        raise ValueError("WORLD_SIZE must be an integer launcher value.") from error
+    if world < 1:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world}.")
+    return world
 
 
 def _force_eager_for_dump(cfg: EngineConfig) -> EngineConfig:
@@ -50,6 +75,21 @@ def _force_eager_without_cuda(cfg: EngineConfig) -> EngineConfig:
     return cfg.replace(runtime=replace(cfg.runtime, use_cuda_graph=False))
 
 
+def _resolve_engine_config(args: "EngineArgs") -> EngineConfig:
+    """Resolve config without performing CUDA or distributed initialization."""
+    resolved = EngineConfig.from_env(base=args.config)
+    if resolved.runtime.debug_tensor_dump_dir is not None:
+        forced = _force_eager_for_dump(resolved)
+        if forced is not resolved:
+            logger.warning(
+                "Tensor dump enabled (debug_tensor_dump_dir=%s): forcing "
+                "use_cuda_graph=False.",
+                resolved.runtime.debug_tensor_dump_dir,
+            )
+        resolved = forced
+    return _force_eager_without_cuda(resolved)
+
+
 @dataclass
 class EntryArgs:
     """Base class for plugin argument dataclasses."""
@@ -60,6 +100,62 @@ class Entry(abc.ABC):
 
     name: ClassVar[str]
     args_cls: ClassVar[type[EntryArgs]]
+    # Logical parallel domains this plugin actually uses. Empty means
+    # single-rank only, so unsupported topology cannot silently duplicate a
+    # complete model on every rank.
+    parallel_domains: ClassVar[frozenset[str]] = frozenset()
+
+    @classmethod
+    def validate_parallel(
+        cls, parallel: "ParallelConfig", replica_world_size: int | None = None
+    ) -> None:
+        """Reject parallel domains this plugin does not implement.
+
+        Plugins declare the domains they implement through
+        :attr:`parallel_domains` and may override this method to add tighter
+        constraints (calling ``super`` first). Resolution is against the
+        launcher's physical rank pool.
+
+        A multi-rank ``pipeline`` or ``cfg`` dimension must be declared. A
+        model domain the plugin does not declare may only follow a declared
+        one: it stays TP-only and its TP groups have the same members as a
+        declared domain's TP groups, so the plugin's layers see one layout
+        without implementing anything for that domain.
+        """
+        world = (
+            parallel.infer_replica_world_size()
+            if replica_world_size is None
+            else replica_world_size
+        )
+        resolved = parallel.resolve(world)
+        unsupported: dict[str, str] = {}
+        for name, size in (
+            ("pipeline", resolved.outer.pipeline_size),
+            ("cfg", resolved.outer.cfg_size),
+        ):
+            if size > 1 and name not in cls.parallel_domains:
+                unsupported[name] = f"size {size}"
+        if resolved.scope_size > 1:
+            declared = [name for name in MODEL_DOMAINS if name in cls.parallel_domains]
+            if not declared:
+                unsupported["model_scope"] = f"size {resolved.scope_size}"
+            else:
+                layout = build_rank_layout(resolved)
+                declared_tp = {layout.groups_for(f"{name}_tp") for name in declared}
+                for name in MODEL_DOMAINS:
+                    if name in cls.parallel_domains:
+                        continue
+                    if not resolved.domain(name).is_tp_only:
+                        unsupported[name] = "uses more than tensor parallelism"
+                    elif layout.groups_for(f"{name}_tp") not in declared_tp:
+                        unsupported[name] = (
+                            f"tp groups differ from {', '.join(declared)}"
+                        )
+        if unsupported:
+            raise ValueError(
+                f"plugin {cls.name!r} supports parallel domains "
+                f"{sorted(cls.parallel_domains)!r}; unsupported: {unsupported!r}."
+            )
 
     @abc.abstractmethod
     def setup(self, args: EntryArgs) -> None:
@@ -87,8 +183,8 @@ class EngineArgs:
     config: EngineConfig | None = None
 
 
-class Engine:
-    """In-process dispatcher for registered model plugins."""
+class EngineCore:
+    """In-process model runtime used by every GPU worker."""
 
     _plugins: ClassVar[dict[str, type[Entry]]] = {}
 
@@ -112,6 +208,13 @@ class Engine:
             raise ValueError(
                 f"plugin name {name!r} is already registered to {existing.__name__}."
             )
+        valid_domains = set(DOMAINS)
+        unknown_domains = set(entry_cls.parallel_domains) - valid_domains
+        if unknown_domains:
+            raise ValueError(
+                f"{entry_cls.__name__}.parallel_domains contains unknown domains "
+                f"{sorted(unknown_domains)!r}; valid domains: {sorted(valid_domains)!r}."
+            )
         cls._plugins[name] = entry_cls
         return entry_cls
 
@@ -120,19 +223,46 @@ class Engine:
         """Return all registered plugin names in registration order."""
         return tuple(cls._plugins.keys())
 
+    @classmethod
+    def plugin_class(cls, name: str) -> type[Entry]:
+        """Resolve one preinstalled plugin without importing wire-provided code."""
+        try:
+            return cls._plugins[name]
+        except KeyError as error:
+            raise ValueError(
+                f"unknown plugin {name!r}; registered: {list(cls._plugins)!r}."
+            ) from error
+
     def __init__(self, args: EngineArgs) -> None:
+        # Resolve the plugin contract before touching CUDA or distributed state.
+        # Invalid public arguments should fail without allocating a process group.
+        entry_cls = self._plugins.get(args.plugin)
+        if entry_cls is None:
+            raise ValueError(
+                f"unknown plugin {args.plugin!r}; registered: {list(self._plugins)!r}."
+            )
+        if not isinstance(args.plugin_args, entry_cls.args_cls):
+            raise TypeError(
+                f"plugin {entry_cls.name!r} expects "
+                f"{entry_cls.args_cls.__name__}; got "
+                f"{type(args.plugin_args).__name__}."
+            )
+        self.args = args
+        self.entry: Entry | None = None
+        self._owns_pg = False
+        self._closed = False
+
         # 1. Resolve the effective engine configuration.
-        resolved = EngineConfig.from_env(base=args.config)
+        resolved = _resolve_engine_config(args)
+        world_size = _runtime_replica_world_size(resolved.parallel)
+        entry_cls.validate_parallel(resolved.parallel, world_size)
         self._dump_enabled = resolved.runtime.debug_tensor_dump_dir is not None
         if self._dump_enabled:
             forced = _force_eager_for_dump(resolved)
             if forced is not resolved:
                 logger.warning_rank0(
-                    "Tensor dump enabled (debug_tensor_dump_dir=%s): forcing "
-                    "use_cuda_graph=False. Forward hooks cannot fire during a captured "
-                    "CUDA-graph replay, so activation capture runs eager-only (slower "
-                    "than the normal graph path).",
-                    resolved.runtime.debug_tensor_dump_dir,
+                    "Forward hooks cannot fire during CUDA-graph replay; "
+                    "activation capture runs eager-only."
                 )
             resolved = forced
         resolved = _force_eager_without_cuda(resolved)
@@ -141,11 +271,12 @@ class Engine:
 
         # 2. Initialize logging and the process environment.
         configure_logging()
-        init_env(world_size=resolved.parallel.world_size, device_type=device_type)
+        init_env(world_size=world_size, device_type=device_type)
         set_ulimit()
         init_process_debug()
 
         self.config: EngineConfig = init_engine_config(resolved)
+        self._replica_world_size = world_size
         self._dumper: TensorDumper | None = None
         self._t_start = time.perf_counter()
 
@@ -162,43 +293,35 @@ class Engine:
             init_cuda(self.config.device.target, self.config.device.params_dtype)
             init_cublas()
 
-        parallel = self.config.parallel
-
         # 5. Initialize the distributed process group.
         with self._stage("dist"):
             self._owns_pg: bool = init_dist(
-                world_size=parallel.world_size,
+                world_size=world_size,
                 device_type=device_type,
                 timeout=timedelta(seconds=self.config.runtime.dist_timeout_s),
+                require_launcher=world_size > 1,
+                device=self.config.device.target,
             )
 
-        # 6. Initialize the parallel mesh and warm its communicators.
+        # 6. Initialize the parallel groups and warm their communicators.
         with self._stage("mesh"):
             mesh = P.init(
-                layout=(
-                    parallel.dp_size,
-                    parallel.cfg_size,
-                    parallel.ep_size,
-                    parallel.sp_size,
-                    parallel.cp_size,
-                    parallel.tp_size,
-                ),
-                mesh_dim_names=("dp", "cfg", "ep", "sp", "cp", "tp"),
+                self.config.parallel,
+                replica_world_size=world_size,
                 device=device_type,
             )
 
         process_title = f"phyai::{args.plugin}"
-        for axis in ("dp", "tp"):
-            if mesh.axis_size(axis) > 1:
-                process_title += f"_{axis.upper()}{mesh.axis_local_rank(axis)}"
+        for group in mesh.distinct_groups():
+            process_title += f"_{group.upper()}{mesh.group_rank(group)}"
         init_process_debug(title=process_title)
 
-        if parallel.world_size > 1:
+        if world_size > 1:
             # Create communicators before any graph capture.
             with self._stage("collectives_warmup"):
                 warmed = P.warmup_collectives()
             if warmed:
-                logger.info_rank0("warmed collectives on axes %s", warmed)
+                logger.info_rank0("warmed collectives on groups %s", warmed)
 
         # 7. Initialize kernel selection.
         with self._stage("kernel"):
@@ -208,21 +331,8 @@ class Engine:
                 model=ModelContext(family=args.plugin),
             )
 
-        # 8. Resolve and initialize the selected model plugin.
-        entry_cls = self._plugins.get(args.plugin)
-        if entry_cls is None:
-            raise ValueError(
-                f"unknown plugin {args.plugin!r}; registered: {list(self._plugins)!r}."
-            )
-        if not isinstance(args.plugin_args, entry_cls.args_cls):
-            raise TypeError(
-                f"plugin {entry_cls.name!r} expects "
-                f"{entry_cls.args_cls.__name__}; got "
-                f"{type(args.plugin_args).__name__}."
-            )
-
-        self.args = args
-        self.entry: Entry = entry_cls()
+        # 8. Initialize the selected model plugin.
+        self.entry = entry_cls()
         with self._stage("plugin_setup"):
             self.entry.setup(args.plugin_args)
 
@@ -261,6 +371,8 @@ class Engine:
 
     def _build_dumper(self) -> TensorDumper | None:
         """Build a tensor dumper from the plugin's dump targets."""
+        if self.entry is None:
+            raise RuntimeError("cannot build a tensor dumper before plugin setup.")
         runtime = self.config.runtime
         targets = self.entry.dump_targets()
         if not targets:
@@ -287,6 +399,10 @@ class Engine:
 
     def step(self, request: Any) -> Any:
         """Run one inference round and flush tensor dumps when enabled."""
+        if self._closed:
+            raise EngineUnavailableError("cannot execute on a closed EngineCore.")
+        if self.entry is None:
+            raise RuntimeError("EngineCore plugin has not been initialized.")
         result = self.entry.step(request)
         if self._dumper is not None:
             self._dumper.flush_pass()
@@ -294,20 +410,181 @@ class Engine:
 
     def close(self) -> None:
         """Release plugin resources and process-level runtime services."""
+        if self._closed:
+            return
+        self._closed = True
+        close_error: BaseException | None = None
         if self._dumper is not None:
-            self._dumper.detach()
+            try:
+                self._dumper.detach()
+            except BaseException as error:
+                close_error = error
             self._dumper = None
-        self.entry.close()
-        if self._owns_pg and dist.is_initialized():
-            dist.destroy_process_group()
+        if self.entry is not None:
+            try:
+                self.entry.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+            self.entry = None
+        try:
+            # Release the collective backends P.init built (direct NCCL
+            # communicators, bootstrap groups, the mesh/dispatcher
+            # singletons) before the torch process group goes away.
+            # Single-rank engines register nothing that needs releasing and
+            # may share a process with sibling engines, so they leave the
+            # process-level registry alone.
+            if self._replica_world_size > 1:
+                P.shutdown()
+        except BaseException as error:
+            if close_error is None:
+                close_error = error
+        try:
+            if self._owns_pg and dist.is_initialized():
+                dist.destroy_process_group()
+        except BaseException as error:
+            if close_error is None:
+                close_error = error
+        finally:
             self._owns_pg = False
-        reset_kernel_selector()
-        release_global_fi_workspaces()
+            try:
+                reset_kernel_selector()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+            try:
+                release_global_fi_workspaces()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if close_error is not None:
+            raise close_error
+
+
+class Engine:
+    """Public facade over inline, managed, distributed, and external execution."""
+
+    _plugins: ClassVar[dict[str, type[Entry]]] = EngineCore._plugins
+
+    @classmethod
+    def register(cls, entry_cls: type[Entry]) -> type[Entry]:
+        """Register a model plugin for both the facade and EngineCore."""
+        return EngineCore.register(entry_cls)
+
+    @classmethod
+    def registered(cls) -> tuple[str, ...]:
+        """Return registered model plugin names in registration order."""
+        return EngineCore.registered()
+
+    def __init__(
+        self,
+        args: EngineArgs,
+        *,
+        deployment: DeploymentConfig | None = None,
+    ) -> None:
+        if not isinstance(args, EngineArgs):
+            raise TypeError(f"Engine expects EngineArgs, got {type(args).__name__}.")
+        if deployment is not None and not isinstance(deployment, DeploymentConfig):
+            raise TypeError(
+                "deployment must be a DeploymentConfig, got "
+                f"{type(deployment).__name__}."
+            )
+        deployment_config = deployment or DeploymentConfig()
+        resolved = _resolve_engine_config(args)
+        resolved_args = replace(args, config=resolved)
+        entry_cls = self._plugins.get(args.plugin)
+        if entry_cls is None:
+            raise ValueError(
+                f"unknown plugin {args.plugin!r}; registered: {list(self._plugins)!r}."
+            )
+        if not isinstance(args.plugin_args, entry_cls.args_cls):
+            raise TypeError(
+                f"plugin {entry_cls.name!r} expects "
+                f"{entry_cls.args_cls.__name__}; got "
+                f"{type(args.plugin_args).__name__}."
+            )
+        world_size = _runtime_replica_world_size(resolved.parallel)
+        entry_cls.validate_parallel(resolved.parallel, world_size)
+        if not 0 <= deployment_config.output_rank < world_size:
+            raise ValueError(
+                f"output_rank={deployment_config.output_rank} is outside the model "
+                f"replica world_size={world_size}."
+            )
+        self.args = resolved_args
+        self.config = resolved
+        self.deployment = deployment_config
+        self._closed = False
+        self._mode, self._dispatcher = build_dispatcher(
+            EngineCore,
+            resolved_args,
+            world_size,
+            deployment_config,
+        )
+        self._core = self._dispatcher.core
+        if deployment_config.auto_start:
+            try:
+                self._dispatcher.setup()
+            except BaseException:
+                self._dispatcher.close()
+                raise
+
+    @property
+    def entry(self) -> Entry | None:
+        """Return the local plugin entry, or ``None`` for managed parents."""
+        return None if self._core is None else self._core.entry
+
+    @property
+    def mode(self) -> str:
+        """Return the resolved execution mode: inline, local, or external."""
+        return self._mode
+
+    def step(self, request: Any) -> Any:
+        """Run one request synchronously through the selected backend."""
+        if self._closed:
+            raise EngineUnavailableError("cannot execute on a closed Engine.")
+        return self._dispatcher.step(request)
+
+    def setup(self) -> None:
+        """Ensure a managed worker group is started; inline engines are ready."""
+        if self._closed:
+            raise EngineUnavailableError("cannot set up a closed Engine.")
+        self._dispatcher.setup()
+
+    def submit(self, request: Any) -> Future[Any]:
+        """Submit a request and return a backend-independent Future.
+
+        On the inline backend a queued (not yet started) request can still be
+        cancelled through ``Future.cancel()``; managed backends dispatch to
+        worker pipes immediately, so their futures are never cancellable.
+        """
+        if self._closed:
+            future: Future[Any] = Future()
+            future.set_exception(
+                EngineUnavailableError("cannot execute on a closed Engine.")
+            )
+            return future
+        return self._dispatcher.submit(request)
+
+    def close(self) -> None:
+        """Close the selected backend exactly once."""
+        if self._closed:
+            return
+        self._closed = True
+        self._dispatcher.close()
+
+    def __enter__(self) -> "Engine":
+        self.setup()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
 
 
 __all__ = [
     "EngineArgs",
     "Engine",
+    "DeploymentConfig",
+    "EngineUnavailableError",
     "Entry",
     "EntryArgs",
 ]
@@ -318,14 +595,9 @@ __all__ = [
 
 from phyai.models.pi0 import main_pi0 as _main_pi0  # noqa: E402, F401
 from phyai.models.pi05 import main_pi05 as _main_pi05  # noqa: E402, F401
-from phyai.models.pi05 import main_pi05_wn as _main_pi05_wn  # noqa: E402, F401
 from phyai.models.cosmos3 import main_cosmos3 as _main_cosmos3  # noqa: E402, F401
-from phyai.models.cosmos3 import main_cosmos3_wn as _main_cosmos3_wn  # noqa: E402, F401
 from phyai.models.cosmos3 import (  # noqa: E402, F401
     main_cosmos3_policy as _main_cosmos3_policy,
-)
-from phyai.models.cosmos3 import (  # noqa: E402, F401
-    main_cosmos3_policy_wn as _main_cosmos3_policy_wn,
 )
 from phyai.models.gr00t_n17 import main_gr00t_n17 as _main_gr00t_n17  # noqa: E402, F401
 from phyai.models.minicpm_gr00t import (  # noqa: E402, F401

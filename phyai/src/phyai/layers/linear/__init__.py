@@ -5,17 +5,18 @@ Quick start::
     import torch.distributed as dist
     import phyai.parallel as P
     import phyai.layers.linear as L
+    from phyai.engine_config import ParallelConfig, DenseParallelConfig
 
     dist.init_process_group("nccl")
-    P.init(layout=(8,), mesh_dim_names=("tp",))
+    P.init(ParallelConfig(dense=DenseParallelConfig(tp_size=8)))
 
     qkv = L.QKVParallelLinear(
         hidden_size=4096, head_dim=128, num_heads=32, num_kv_heads=8,
-        axis="tp", spec=L.Bf16Spec(),
+        group="attention_tp", spec=L.Bf16Spec(),
     )
     o_proj = L.RowParallelLinear(
         in_features=4096, out_features=4096,
-        axis="tp", sp_axis="sp",
+        group="attention_tp", sequence_parallel=True,
         spec=L.Fp8Spec(granularity=L.Granularity.PER_CHANNEL),
     )
 """

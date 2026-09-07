@@ -54,7 +54,7 @@ def init_threads(*, device_type: str, num_threads: int | None = None) -> int:
     threads contend on the same shard reads and allocator locks (sglang
     sets ``num_threads=1`` right before ``load_model`` for exactly this
     reason). Second, and worse for phyai's latency-critical robot
-    workloads: TP=8 or several DP replicas on one box means eight
+    workloads: TP=8 or several serving replicas on one box means eight
     processes each opening a core-count-sized pool, oversubscribing the
     machine by an order of magnitude and showing up as launch-side jitter
     in p99.

@@ -307,8 +307,7 @@ class GatedRMSNorm(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"{self.hidden_size}, eps={self.variance_epsilon}, "
-            f"backend={self.backend!r}"
+            f"{self.hidden_size}, eps={self.variance_epsilon}, backend={self.backend!r}"
         )
 
 
