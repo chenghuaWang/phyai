@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from tqdm import tqdm
 
+from phyai.layers.layer_norm import RMSNorm
 from phyai.models.dreamzero.configuration_dreamzero import DreamZeroVAEConfig
 from phyai.weights.shards import replicated
 
@@ -67,26 +68,6 @@ class CausalConv3d(nn.Conv3d):
         x = F.pad(x, padding)
 
         return super().forward(x)
-
-
-class RMS_norm(nn.Module):
-    def __init__(self, dim, channel_first=True, images=True, bias=False):
-        super().__init__()
-        broadcastable_dims = (1, 1, 1) if not images else (1, 1)
-        shape = (dim, *broadcastable_dims) if channel_first else (dim,)
-
-        self.channel_first = channel_first
-        self.scale = dim**0.5
-        self.gamma = nn.Parameter(torch.ones(shape))
-        self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
-
-    def forward(self, x):
-        return (
-            F.normalize(x, dim=(1 if self.channel_first else -1))
-            * self.scale
-            * self.gamma
-            + self.bias
-        )
 
 
 class Upsample(nn.Upsample):
@@ -259,10 +240,22 @@ class ResidualBlock(nn.Module):
 
         # layers
         self.residual = nn.Sequential(
-            RMS_norm(in_dim, images=False),
+            RMSNorm(
+                in_dim,
+                variant="l2",
+                norm_dim=1,
+                affine_shape=(in_dim, 1, 1, 1),
+                device="cpu",
+            ),
             nn.SiLU(),
             CausalConv3d(in_dim, out_dim, 3, padding=1),
-            RMS_norm(out_dim, images=False),
+            RMSNorm(
+                out_dim,
+                variant="l2",
+                norm_dim=1,
+                affine_shape=(out_dim, 1, 1, 1),
+                device="cpu",
+            ),
             nn.SiLU(),
             nn.Dropout(dropout),
             CausalConv3d(out_dim, out_dim, 3, padding=1),
@@ -304,7 +297,9 @@ class AttentionBlock(nn.Module):
         self.dim = dim
 
         # layers
-        self.norm = RMS_norm(dim)
+        self.norm = RMSNorm(
+            dim, variant="l2", norm_dim=1, affine_shape=(dim, 1, 1), device="cpu"
+        )
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
 
@@ -489,7 +484,13 @@ class Encoder3d(nn.Module):
 
         # output blocks
         self.head = nn.Sequential(
-            RMS_norm(out_dim, images=False),
+            RMSNorm(
+                out_dim,
+                variant="l2",
+                norm_dim=1,
+                affine_shape=(out_dim, 1, 1, 1),
+                device="cpu",
+            ),
             nn.SiLU(),
             CausalConv3d(out_dim, z_dim, 3, padding=1),
         )
@@ -603,7 +604,13 @@ class Decoder3d(nn.Module):
 
         # output blocks
         self.head = nn.Sequential(
-            RMS_norm(out_dim, images=False),
+            RMSNorm(
+                out_dim,
+                variant="l2",
+                norm_dim=1,
+                affine_shape=(out_dim, 1, 1, 1),
+                device="cpu",
+            ),
             nn.SiLU(),
             CausalConv3d(out_dim, 3, 3, padding=1),
         )

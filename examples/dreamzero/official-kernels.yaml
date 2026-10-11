@@ -4,3 +4,6 @@ overrides:
   - id: dreamzero-official-layernorm
     match: {op: layernorm}
     use: torch.layernorm
+  - id: dreamzero-official-vae-rmsnorm
+    match: {op: rmsnorm, attrs.variant: l2}
+    use: torch.rmsnorm_l2

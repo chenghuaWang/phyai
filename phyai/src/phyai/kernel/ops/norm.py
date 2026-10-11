@@ -47,6 +47,9 @@ def _bench_dims(facts) -> tuple[int, int]:
 
 def _bench_rmsnorm(facts, device):
     tokens, hidden = _bench_dims(facts)
+    if facts.lookup("attrs.variant") == "l2":
+        # Token counts do not describe the original channel strides or affine shape.
+        raise NotImplementedError("L2 RMSNorm benchmarking needs the original layout")
     x = _bench_tensor(facts, device, "input", tokens, hidden)
     weight = _bench_tensor(facts, device, "weight", hidden)
     return (x, weight, 1e-6)
@@ -86,9 +89,11 @@ RMSNORM = OpSpec(
     name="rmsnorm",
     dims=("tokens", "hidden"),
     dtypes=("input", "weight"),
+    optional_dtypes=("bias",),
     attributes=("variant",),
+    optional_attributes=("norm_dim", "bias"),
     params=("weight",),
-    signature="(x, weight, eps) -> Tensor",
+    signature="(x, weight, eps, bias=0.0) -> Tensor",
     bench_args=_bench_rmsnorm,
 )
 
@@ -132,6 +137,13 @@ RMSNORM_SILU_MUL = OpSpec(
     bench_args=_bench_rmsnorm_silu_mul,
 )
 
+
+# Existing implementations normalize the last axis with mean-square epsilon.
+STANDARD_RMSNORM = all_of(
+    implies(attrs.variant.is_set(), attrs.variant.in_({"rms", "gemma"})),
+    implies(attrs.norm_dim.is_set(), attrs.norm_dim == -1),
+    implies(attrs.bias.is_set(), attrs.bias == False),
+)
 
 # FlashInfer RMSNorm requires bf16 input and weight tensors.
 FLASHINFER_RMSNORM = all_of(
@@ -203,6 +215,19 @@ def _torch_rmsnorm_fn(gemma: bool):
 
 def _torch_rmsnorm(facts, params):
     return _torch_rmsnorm_fn(_gemma(facts))
+
+
+def _torch_rmsnorm_l2(facts, params):
+    import torch.nn.functional as F
+
+    axis = int(facts.lookup("attrs.norm_dim"))
+    scale = int(facts.lookup("shape.hidden")) ** 0.5
+
+    def rmsnorm(x, weight, eps, bias=0.0):
+        # Preserve separate rounding, broadcast parameters and ambient autocast.
+        return F.normalize(x, p=2.0, dim=axis, eps=eps) * scale * weight + bias
+
+    return rmsnorm
 
 
 def _torch_rmsnorm_add(facts, params):
@@ -292,7 +317,7 @@ def register(catalog: Catalog) -> None:
                 kernel_id="flashinfer.rmsnorm",
                 op="rmsnorm",
                 priority=Priority.OPTIMIZED + 2,
-                when=FLASHINFER_RMSNORM,
+                when=all_of(FLASHINFER_RMSNORM, STANDARD_RMSNORM),
                 prepare=_flashinfer_rmsnorm,
                 # Allocate gamma in the activation dtype.
                 params={"weight": matches_activation()},
@@ -301,7 +326,7 @@ def register(catalog: Catalog) -> None:
                 kernel_id="phyai_kernel.rmsnorm",
                 op="rmsnorm",
                 priority=Priority.OPTIMIZED,
-                when=TRITON_NORM,
+                when=all_of(TRITON_NORM, STANDARD_RMSNORM),
                 prepare=_triton_rmsnorm,
                 params={"weight": any_float()},
             ),
@@ -310,8 +335,24 @@ def register(catalog: Catalog) -> None:
                 op="rmsnorm",
                 priority=Priority.REFERENCE,
                 reference=True,
-                when=dtype.input.is_set(),
+                when=all_of(dtype.input.is_set(), STANDARD_RMSNORM),
                 prepare=_torch_rmsnorm,
+                params={"weight": any_float()},
+            ),
+            Impl(
+                kernel_id="torch.rmsnorm_l2",
+                op="rmsnorm",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=all_of(
+                    attrs.variant == "l2",
+                    attrs.norm_dim.is_set(),
+                    implies(
+                        attrs.bias, dtype.bias.in_({"fp16", "bf16", "fp32", "fp64"})
+                    ),
+                    dtype.input.in_({"fp16", "bf16", "fp32", "fp64"}),
+                ),
+                prepare=_torch_rmsnorm_l2,
                 params={"weight": any_float()},
             ),
             # Fused RMSNorm and residual add.

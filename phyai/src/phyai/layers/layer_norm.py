@@ -29,7 +29,7 @@ fp32 gamma and beta while its RMSNorm reads gamma through the input's C type;
 :class:`LayerNorm` asks the selector which dtype keeps the strongest
 implementation eligible instead of testing a backend name.
 
-Reductions and the affine multiply run in fp32 on every backend; output
+For standard variants, reductions and the affine multiply run in fp32; output
 is cast back to ``x.dtype``. RMSNorm's ``forward`` accepts an optional
 ``residual`` for the fused ``residual += x; rmsnorm(residual)`` path used
 between attention and the MLP in most decoder blocks. LayerNorm has no
@@ -85,6 +85,13 @@ class RMSNorm(nn.Module):
         do *not* leave it as the fp32 default. The ``"phyai-kernel"``
         Triton path accepts any floating dtype.
 
+    ``variant="l2"`` preserves ``F.normalize(x, dim=norm_dim, eps=eps)``
+    followed by separate ``sqrt(hidden_size)``, gamma and bias operations.
+    Its default epsilon is 1e-12 and its affine parameter is named ``gamma``.
+    ``affine_shape`` preserves channel-first checkpoint broadcasting; no input
+    permutation or dtype conversion is performed. Kernel policy selects a
+    compatible implementation of the same ``rmsnorm`` operation.
+
     The forward signature is ``forward(x, residual=None)``:
 
     * with ``residual`` left as ``None``, returns the normalized tensor;
@@ -99,15 +106,33 @@ class RMSNorm(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        eps: float = 1e-6,
+        eps: float | None = None,
         backend: str | None = None,
         *,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
         kernel_role: str = "norm",
+        variant: str = "rms",
+        norm_dim: int = -1,
+        affine_shape: tuple[int, ...] | None = None,
+        bias: bool = False,
     ) -> None:
         super().__init__()
+        if variant not in ("rms", "l2"):
+            raise ValueError(f"Unknown RMSNorm variant: {variant!r}")
+        if hidden_size <= 0:
+            raise ValueError("RMSNorm: hidden_size must be positive")
+        if variant != "l2" and (norm_dim != -1 or affine_shape is not None or bias):
+            raise ValueError("Custom axis, affine shape and bias require variant='l2'")
+        self._variant = variant
+        if variant == "l2" and self.variant != "l2":
+            raise ValueError(
+                "L2 normalization cannot be combined with a subclass variant"
+            )
+        self.norm_dim = norm_dim
+        if eps is None:
+            eps = 1e-12 if variant == "l2" else 1e-6
         self.backend = backend
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
@@ -134,18 +159,38 @@ class RMSNorm(nn.Module):
             prefer=self._prefer_fused,
             dims={"hidden": hidden_size},
         )
-        self.weight = nn.Parameter(
-            self._initial_weight(hidden_size, dtype, device), requires_grad=False
-        )
-        if prefix:
-            self.weight.hf_keys = [(f"{prefix}.weight", None)]
-            self.weight.weight_loader = replicated()
+        if variant == "l2":
+            parameter_shape = affine_shape or (hidden_size,)
+            if (
+                any(size not in (1, hidden_size) for size in parameter_shape)
+                or torch.Size(parameter_shape).numel() != hidden_size
+            ):
+                raise ValueError("affine_shape must contain exactly hidden_size values")
+            self.gamma = nn.Parameter(
+                torch.ones(parameter_shape, dtype=dtype, device=device)
+            )
+            self.bias = (
+                nn.Parameter(torch.zeros(parameter_shape, dtype=dtype, device=device))
+                if bias
+                else 0.0
+            )
+            if prefix:
+                for name, parameter in self.named_parameters():
+                    parameter.hf_keys = [(f"{prefix}.{name}", None)]
+                    parameter.weight_loader = replicated()
+        else:
+            self.weight = nn.Parameter(
+                self._initial_weight(hidden_size, dtype, device), requires_grad=False
+            )
+            if prefix:
+                self.weight.hf_keys = [(f"{prefix}.weight", None)]
+                self.weight.weight_loader = replicated()
 
     @property
     def variant(self) -> str:
-        """``"gemma"`` for the ``(1 + w)`` subclass, else ``"rms"``."""
+        """The normalization semantics used to filter compatible kernels."""
 
-        return "rms"
+        return self._variant
 
     @staticmethod
     def _initial_weight(
@@ -161,6 +206,31 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.variant == "l2":
+            if residual is not None:
+                raise ValueError("L2 RMSNorm does not support fused residual addition")
+            if not -x.ndim <= self.norm_dim < x.ndim:
+                raise ValueError("RMSNorm: input has no normalization dimension")
+            if x.shape[self.norm_dim] != self.hidden_size:
+                raise ValueError(
+                    "RMSNorm: normalization dimension does not match hidden_size"
+                )
+            dtypes = {"input": x.dtype, "weight": self.gamma.dtype}
+            has_bias = isinstance(self.bias, torch.Tensor)
+            if has_bias:
+                dtypes["bias"] = self.bias.dtype
+            handle = self._plain_call.select(
+                device=x.device,
+                dtype=dtypes,
+                dims={"tokens": x.numel() // self.hidden_size},
+                attrs={
+                    "variant": self.variant,
+                    "norm_dim": self.norm_dim,
+                    "bias": has_bias,
+                },
+            )
+            return handle.execute(x, self.gamma, self.variance_epsilon, self.bias)
+
         dtypes: dict[str, object] = {
             "input": x.dtype,
             "weight": self.weight.dtype,
