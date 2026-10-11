@@ -215,6 +215,21 @@ class RMSNorm(nn.Module):
                 raise ValueError(
                     "RMSNorm: normalization dimension does not match hidden_size"
                 )
+            axis = self.norm_dim % x.ndim
+            expected_affine_shape = tuple(
+                self.hidden_size if dim == axis else 1 for dim in range(x.ndim)
+            )
+            aligned_affine_shape = (1,) * (x.ndim - self.gamma.ndim) + tuple(
+                self.gamma.shape
+            )
+            if (
+                self.gamma.ndim > x.ndim
+                or aligned_affine_shape != expected_affine_shape
+            ):
+                raise ValueError(
+                    "RMSNorm: affine_shape must align with the normalization dimension "
+                    "without expanding the input rank"
+                )
             dtypes = {"input": x.dtype, "weight": self.gamma.dtype}
             has_bias = isinstance(self.bias, torch.Tensor)
             if has_bias:

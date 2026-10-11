@@ -201,3 +201,78 @@ def test_gemma_rejects_conflicting_l2_variant():
 
     with pytest.raises(ValueError, match="subclass variant"):
         GemmaRMSNorm(7, variant="l2", device="cpu")
+
+
+@pytest.mark.parametrize("axis_attrs", [{}, {"norm_dim": None}])
+def test_l2_requires_axis_before_prepare(monkeypatch, axis_attrs):
+    from unittest.mock import Mock
+
+    from phyai.kernel.ops import norm
+    from phyai.kernel.selector import NoKernelError
+
+    prepare = Mock(side_effect=AssertionError("must reject before prepare"))
+    monkeypatch.setattr(norm, "_torch_rmsnorm_l2", prepare)
+    initialize_kernel_system(KernelConfig())
+    with pytest.raises(NoKernelError, match="norm_dim"):
+        select(
+            "rmsnorm",
+            device="cpu",
+            dtype={"input": torch.float32, "weight": torch.float32},
+            shape={"hidden": 7, "tokens": 3},
+            attrs={"variant": "l2", "bias": False, **axis_attrs},
+        )
+    prepare.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "hidden,shape,axis,affine_shape",
+    [
+        (7, (1, 7, 7), 1, (1, 7)),
+        (7, (1, 7, 7), -2, (1, 7)),
+        (7, (7, 7), -1, (7, 1)),
+        (7, (3, 7), -1, (1, 1, 7)),
+        (1, (3, 1), -1, (1, 1, 1)),
+    ],
+)
+@pytest.mark.parametrize("bias", [False, True])
+def test_l2_rejects_affine_axis_mismatch(hidden, shape, axis, affine_shape, bias):
+    layer = RMSNorm(
+        hidden,
+        variant="l2",
+        norm_dim=axis,
+        affine_shape=affine_shape,
+        bias=bias,
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="affine_shape must align"):
+        layer(torch.randn(shape))
+    assert not layer._plain_call._memo
+
+
+@pytest.mark.parametrize(
+    "hidden,shape,axis,affine_shape",
+    [
+        (7, (1, 7, 7), -2, (7, 1)),
+        (7, (7, 3, 2), 0, (7, 1, 1)),
+        (7, (3, 7), -1, (1, 7)),
+        (1, (3, 1, 2), 1, (1,)),
+        (1, (3, 1, 2), -2, (1, 1, 1)),
+    ],
+)
+def test_l2_accepts_affine_aligned_to_axis(hidden, shape, axis, affine_shape):
+    layer = RMSNorm(
+        hidden,
+        variant="l2",
+        norm_dim=axis,
+        affine_shape=affine_shape,
+        bias=True,
+        device="cpu",
+    )
+    with torch.no_grad():
+        layer.gamma.normal_()
+        layer.bias.normal_()
+    x = torch.randn(shape)
+    actual = layer(x)
+    expected = F.normalize(x, dim=axis) * hidden**0.5 * layer.gamma + layer.bias
+    assert actual.shape == x.shape
+    assert torch.equal(actual, expected)

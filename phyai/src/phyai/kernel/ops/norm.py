@@ -12,7 +12,7 @@ from phyai.kernel.opspec import (
     matches_activation,
 )
 from phyai.kernel.registry import Catalog
-from phyai.kernel.predicate import all_of, implies
+from phyai.kernel.predicate import all_of, implies, none_of
 
 NVIDIA = device.vendor == "nvidia"
 NVIDIA_FLASHINFER = lib.has("flashinfer") & NVIDIA
@@ -346,7 +346,8 @@ def register(catalog: Catalog) -> None:
                 reference=True,
                 when=all_of(
                     attrs.variant == "l2",
-                    attrs.norm_dim.is_set(),
+                    # Optional leaves pass when absent; negate is_none to require an axis.
+                    none_of(attrs.norm_dim.is_none()),
                     implies(
                         attrs.bias, dtype.bias.in_({"fp16", "bf16", "fp32", "fp64"})
                     ),

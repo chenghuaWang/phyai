@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from phyai.layers.linear import ReplicatedLinear
 from phyai.models.dreamzero.configuration_dreamzero import DreamZeroTextEncoderConfig
 from phyai.weights.shards import replicated
 
@@ -151,10 +152,22 @@ class T5Attention(nn.Module):
         self.dim_attn = dim_attn
         self.num_heads = num_heads
         self.head_dim = dim_attn // num_heads
-        self.q = nn.Linear(dim, dim_attn, bias=False, dtype=params_dtype, device=device)
-        self.k = nn.Linear(dim, dim_attn, bias=False, dtype=params_dtype, device=device)
-        self.v = nn.Linear(dim, dim_attn, bias=False, dtype=params_dtype, device=device)
-        self.o = nn.Linear(dim_attn, dim, bias=False, dtype=params_dtype, device=device)
+        device = torch.get_default_device() if device is None else device
+        params_dtype = (
+            torch.get_default_dtype() if params_dtype is None else params_dtype
+        )
+        self.q = ReplicatedLinear(
+            dim, dim_attn, bias=False, params_dtype=params_dtype, device=device
+        )
+        self.k = ReplicatedLinear(
+            dim, dim_attn, bias=False, params_dtype=params_dtype, device=device
+        )
+        self.v = ReplicatedLinear(
+            dim, dim_attn, bias=False, params_dtype=params_dtype, device=device
+        )
+        self.o = ReplicatedLinear(
+            dim_attn, dim, bias=False, params_dtype=params_dtype, device=device
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(
@@ -166,9 +179,12 @@ class T5Attention(nn.Module):
     ) -> torch.Tensor:
         context = x if context is None else context
         batch_size = x.size(0)
-        q = self.q(x).view(batch_size, -1, self.num_heads, self.head_dim)
-        k = self.k(context).view(batch_size, -1, self.num_heads, self.head_dim)
-        v = self.v(context).view(batch_size, -1, self.num_heads, self.head_dim)
+        q, _ = self.q(x)
+        k, _ = self.k(context)
+        v, _ = self.v(context)
+        q = q.view(batch_size, -1, self.num_heads, self.head_dim)
+        k = k.view(batch_size, -1, self.num_heads, self.head_dim)
+        v = v.view(batch_size, -1, self.num_heads, self.head_dim)
 
         attn_bias = x.new_zeros(
             batch_size,
@@ -195,7 +211,16 @@ class T5Attention(nn.Module):
         attn = F.softmax(attn.float(), dim=-1).type_as(attn)
         out = torch.einsum("bnij,bjnc->binc", attn, v)
         out = out.reshape(batch_size, -1, self.dim_attn)
-        return self.dropout(self.o(out))
+        out, _ = self.o(out)
+        return self.dropout(out)
+
+
+class T5Gate(nn.Sequential):
+    """Preserve gate checkpoint indices while unpacking the linear output."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, _ = self[0](x)
+        return self[1](x)
 
 
 class T5FeedForward(nn.Module):
@@ -211,22 +236,29 @@ class T5FeedForward(nn.Module):
         super().__init__()
         self.dim = dim
         self.dim_ffn = dim_ffn
-        self.gate = nn.Sequential(
-            nn.Linear(dim, dim_ffn, bias=False, dtype=params_dtype, device=device),
+        device = torch.get_default_device() if device is None else device
+        params_dtype = (
+            torch.get_default_dtype() if params_dtype is None else params_dtype
+        )
+        self.gate = T5Gate(
+            ReplicatedLinear(
+                dim, dim_ffn, bias=False, params_dtype=params_dtype, device=device
+            ),
             T5GELU(),
         )
-        self.fc1 = nn.Linear(
-            dim, dim_ffn, bias=False, dtype=params_dtype, device=device
+        self.fc1 = ReplicatedLinear(
+            dim, dim_ffn, bias=False, params_dtype=params_dtype, device=device
         )
-        self.fc2 = nn.Linear(
-            dim_ffn, dim, bias=False, dtype=params_dtype, device=device
+        self.fc2 = ReplicatedLinear(
+            dim_ffn, dim, bias=False, params_dtype=params_dtype, device=device
         )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x) * self.gate(x)
+        hidden, _ = self.fc1(x)
+        x = hidden * self.gate(x)
         x = self.dropout(x)
-        x = self.fc2(x)
+        x, _ = self.fc2(x)
         return self.dropout(x)
 
 
