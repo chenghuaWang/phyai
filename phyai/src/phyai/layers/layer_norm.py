@@ -29,7 +29,7 @@ fp32 gamma and beta while its RMSNorm reads gamma through the input's C type;
 :class:`LayerNorm` asks the selector which dtype keeps the strongest
 implementation eligible instead of testing a backend name.
 
-For standard variants, reductions and the affine multiply run in fp32; output
+Reductions and the affine multiply run in fp32 on every backend; output
 is cast back to ``x.dtype``. RMSNorm's ``forward`` accepts an optional
 ``residual`` for the fused ``residual += x; rmsnorm(residual)`` path used
 between attention and the MLP in most decoder blocks. LayerNorm has no
@@ -73,6 +73,9 @@ class RMSNorm(nn.Module):
     backend:
         ``"flashinfer"`` (default) or ``"phyai-kernel"``. Underscore,
         hyphen, and case are normalized.
+    elementwise_affine:
+        Whether to register a weight parameter. If False, use a fixed identity
+        weight buffer that is excluded from checkpoints.
     dtype:
         Optional weight dtype. Defaults to the global default dtype.
         **flashinfer caveat**: the CUDA RMSNorm / GemmaRMSNorm /
@@ -84,13 +87,11 @@ class RMSNorm(nn.Module):
         tensor that will be normalized (typically ``torch.bfloat16``);
         do *not* leave it as the fp32 default. The ``"phyai-kernel"``
         Triton path accepts any floating dtype.
-
-    ``variant="l2"`` preserves ``F.normalize(x, dim=norm_dim, eps=eps)``
-    followed by separate ``sqrt(hidden_size)``, gamma and bias operations.
-    Its default epsilon is 1e-12 and its affine parameter is named ``gamma``.
-    ``affine_shape`` preserves channel-first checkpoint broadcasting; no input
-    permutation or dtype conversion is performed. Kernel policy selects a
-    compatible implementation of the same ``rmsnorm`` operation.
+    cast_before_affine:
+        Round normalized values to the activation dtype before multiplying
+        gamma. This matches checkpoints whose reference uses a separate
+        low-precision affine multiply; weight and activation dtypes must match.
+        Has no effect when ``elementwise_affine=False``.
 
     The forward signature is ``forward(x, residual=None)``:
 
@@ -106,38 +107,26 @@ class RMSNorm(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        eps: float | None = None,
+        eps: float = 1e-6,
         backend: str | None = None,
         *,
+        elementwise_affine: bool = True,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
         kernel_role: str = "norm",
-        variant: str = "rms",
-        norm_dim: int = -1,
-        affine_shape: tuple[int, ...] | None = None,
-        bias: bool = False,
+        cast_before_affine: bool = False,
     ) -> None:
         super().__init__()
-        if variant not in ("rms", "l2"):
-            raise ValueError(f"Unknown RMSNorm variant: {variant!r}")
-        if hidden_size <= 0:
-            raise ValueError("RMSNorm: hidden_size must be positive")
-        if variant != "l2" and (norm_dim != -1 or affine_shape is not None or bias):
-            raise ValueError("Custom axis, affine shape and bias require variant='l2'")
-        self._variant = variant
-        if variant == "l2" and self.variant != "l2":
-            raise ValueError(
-                "L2 normalization cannot be combined with a subclass variant"
-            )
-        self.norm_dim = norm_dim
-        if eps is None:
-            eps = 1e-12 if variant == "l2" else 1e-6
         self.backend = backend
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
         self.prefix = prefix
         self.kernel_role = kernel_role
+        self.elementwise_affine = elementwise_affine
+        self.cast_before_affine = cast_before_affine and elementwise_affine
+        if self.cast_before_affine and self.variant != "rms":
+            raise ValueError("cast_before_affine applies to standard RMSNorm only")
         if device is None:
             device = get_engine_config().device.target
         # Validates the hint against the catalog and records the kernel ids to
@@ -159,38 +148,24 @@ class RMSNorm(nn.Module):
             prefer=self._prefer_fused,
             dims={"hidden": hidden_size},
         )
-        if variant == "l2":
-            parameter_shape = affine_shape or (hidden_size,)
-            if (
-                any(size not in (1, hidden_size) for size in parameter_shape)
-                or torch.Size(parameter_shape).numel() != hidden_size
-            ):
-                raise ValueError("affine_shape must contain exactly hidden_size values")
-            self.gamma = nn.Parameter(
-                torch.ones(parameter_shape, dtype=dtype, device=device)
-            )
-            self.bias = (
-                nn.Parameter(torch.zeros(parameter_shape, dtype=dtype, device=device))
-                if bias
-                else 0.0
-            )
-            if prefix:
-                for name, parameter in self.named_parameters():
-                    parameter.hf_keys = [(f"{prefix}.{name}", None)]
-                    parameter.weight_loader = replicated()
+        weight = self._initial_weight(hidden_size, dtype, device)
+        if elementwise_affine:
+            self.weight = nn.Parameter(weight, requires_grad=False)
         else:
-            self.weight = nn.Parameter(
-                self._initial_weight(hidden_size, dtype, device), requires_grad=False
+            self.register_buffer("weight", weight, persistent=False)
+        if self.cast_before_affine:
+            self.register_buffer(
+                "_unit_weight", torch.ones_like(self.weight), persistent=False
             )
-            if prefix:
-                self.weight.hf_keys = [(f"{prefix}.weight", None)]
-                self.weight.weight_loader = replicated()
+        if prefix and elementwise_affine:
+            self.weight.hf_keys = [(f"{prefix}.weight", None)]
+            self.weight.weight_loader = replicated()
 
     @property
     def variant(self) -> str:
-        """The normalization semantics used to filter compatible kernels."""
+        """``"gemma"`` for the ``(1 + w)`` subclass, else ``"rms"``."""
 
-        return self._variant
+        return "rms"
 
     @staticmethod
     def _initial_weight(
@@ -206,49 +181,14 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.variant == "l2":
-            if residual is not None:
-                raise ValueError("L2 RMSNorm does not support fused residual addition")
-            if not -x.ndim <= self.norm_dim < x.ndim:
-                raise ValueError("RMSNorm: input has no normalization dimension")
-            if x.shape[self.norm_dim] != self.hidden_size:
-                raise ValueError(
-                    "RMSNorm: normalization dimension does not match hidden_size"
-                )
-            axis = self.norm_dim % x.ndim
-            expected_affine_shape = tuple(
-                self.hidden_size if dim == axis else 1 for dim in range(x.ndim)
+        if self.cast_before_affine and self.weight.dtype != x.dtype:
+            raise ValueError(
+                "cast_before_affine requires matching activation and weight dtypes"
             )
-            aligned_affine_shape = (1,) * (x.ndim - self.gamma.ndim) + tuple(
-                self.gamma.shape
-            )
-            if (
-                self.gamma.ndim > x.ndim
-                or aligned_affine_shape != expected_affine_shape
-            ):
-                raise ValueError(
-                    "RMSNorm: affine_shape must align with the normalization dimension "
-                    "without expanding the input rank"
-                )
-            dtypes = {"input": x.dtype, "weight": self.gamma.dtype}
-            has_bias = isinstance(self.bias, torch.Tensor)
-            if has_bias:
-                dtypes["bias"] = self.bias.dtype
-            handle = self._plain_call.select(
-                device=x.device,
-                dtype=dtypes,
-                dims={"tokens": x.numel() // self.hidden_size},
-                attrs={
-                    "variant": self.variant,
-                    "norm_dim": self.norm_dim,
-                    "bias": has_bias,
-                },
-            )
-            return handle.execute(x, self.gamma, self.variance_epsilon, self.bias)
-
+        weight = self._unit_weight if self.cast_before_affine else self.weight
         dtypes: dict[str, object] = {
             "input": x.dtype,
-            "weight": self.weight.dtype,
+            "weight": weight.dtype,
             "output": x.dtype,
         }
 
@@ -264,9 +204,12 @@ class RMSNorm(nn.Module):
                 attrs={"variant": self.variant},
             )
             if x.dim() == 2:
-                return handle.execute(
-                    x, residual, self.weight.data, self.variance_epsilon
+                out, res = handle.execute(
+                    x, residual, weight.data, self.variance_epsilon
                 )
+                if self.cast_before_affine:
+                    out.mul_(self.weight)
+                return out, res
             # Fused kernels operate on (tokens, hidden). For contiguous inputs
             # the reshape is a view, so the kernels' in-place writes still land
             # in the caller's buffers.
@@ -274,9 +217,11 @@ class RMSNorm(nn.Module):
             out, res = handle.execute(
                 x.reshape(-1, orig_shape[-1]),
                 residual.reshape(-1, orig_shape[-1]),
-                self.weight.data,
+                weight.data,
                 self.variance_epsilon,
             )
+            if self.cast_before_affine:
+                out.mul_(self.weight)
             return out.reshape(orig_shape), res.reshape(orig_shape)
 
         handle = self._plain_call.select(
@@ -289,12 +234,15 @@ class RMSNorm(nn.Module):
         if needs_reshape:
             orig_shape = x.shape
             x = x.contiguous().reshape(-1, orig_shape[-1])
-        out = handle.execute(x, self.weight.data, self.variance_epsilon)
+        out = handle.execute(x, weight.data, self.variance_epsilon)
+        if self.cast_before_affine:
+            out = out * self.weight
         return out.reshape(orig_shape) if needs_reshape else out
 
     def extra_repr(self) -> str:
         return (
-            f"{self.hidden_size}, eps={self.variance_epsilon}, backend={self.backend!r}"
+            f"{self.hidden_size}, eps={self.variance_epsilon}, backend={self.backend!r}, "
+            f"elementwise_affine={self.elementwise_affine}"
         )
 
 
@@ -420,6 +368,9 @@ class LayerNorm(nn.Module):
         (the typical encoder configuration). flashinfer's kernel always
         reads ``beta``; when ``bias=False`` the wrapper feeds it a zero
         buffer so the kernel's add becomes a no-op.
+    elementwise_affine:
+        If False, use nonpersistent identity buffers instead of checkpoint
+        parameters. The same selected normalization kernel still runs.
     dtype:
         Optional weight / bias dtype. Defaults to the global default.
         flashinfer's CUDA kernel hard-checks ``gamma`` / ``beta`` in
@@ -446,6 +397,7 @@ class LayerNorm(nn.Module):
         backend: str | None = None,
         *,
         bias: bool = True,
+        elementwise_affine: bool = True,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
@@ -457,6 +409,8 @@ class LayerNorm(nn.Module):
         self.backend = backend
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
+        self.elementwise_affine = elementwise_affine
+        bias = bias and elementwise_affine
         self.has_bias = bias
         self.prefix = prefix
         self.kernel_role = kernel_role
@@ -502,10 +456,11 @@ class LayerNorm(nn.Module):
         param_dtype = torch_dtype(chosen["weight"])
         beta_dtype = torch_dtype(chosen.get("bias", chosen["weight"]))
 
-        self.weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=param_dtype, device=device),
-            requires_grad=False,
-        )
+        weight = torch.ones(hidden_size, dtype=param_dtype, device=device)
+        if elementwise_affine:
+            self.weight = nn.Parameter(weight, requires_grad=False)
+        else:
+            self.register_buffer("weight", weight, persistent=False)
         if bias:
             self.bias = nn.Parameter(
                 torch.zeros(hidden_size, dtype=beta_dtype, device=device),
@@ -523,7 +478,7 @@ class LayerNorm(nn.Module):
                 persistent=False,
             )
 
-        if prefix:
+        if prefix and elementwise_affine:
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
             self.weight.weight_loader = replicated()
             if bias:
@@ -552,7 +507,8 @@ class LayerNorm(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"{self.hidden_size}, eps={self.variance_epsilon}, "
-            f"bias={self.has_bias}, backend={self.backend!r}"
+            f"bias={self.has_bias}, elementwise_affine={self.elementwise_affine}, "
+            f"backend={self.backend!r}"
         )
 
 

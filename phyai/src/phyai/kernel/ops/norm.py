@@ -12,7 +12,7 @@ from phyai.kernel.opspec import (
     matches_activation,
 )
 from phyai.kernel.registry import Catalog
-from phyai.kernel.predicate import all_of, implies, none_of
+from phyai.kernel.predicate import all_of, implies
 
 NVIDIA = device.vendor == "nvidia"
 NVIDIA_FLASHINFER = lib.has("flashinfer") & NVIDIA
@@ -47,9 +47,6 @@ def _bench_dims(facts) -> tuple[int, int]:
 
 def _bench_rmsnorm(facts, device):
     tokens, hidden = _bench_dims(facts)
-    if facts.lookup("attrs.variant") == "l2":
-        # Token counts do not describe the original channel strides or affine shape.
-        raise NotImplementedError("L2 RMSNorm benchmarking needs the original layout")
     x = _bench_tensor(facts, device, "input", tokens, hidden)
     weight = _bench_tensor(facts, device, "weight", hidden)
     return (x, weight, 1e-6)
@@ -89,11 +86,9 @@ RMSNORM = OpSpec(
     name="rmsnorm",
     dims=("tokens", "hidden"),
     dtypes=("input", "weight"),
-    optional_dtypes=("bias",),
     attributes=("variant",),
-    optional_attributes=("norm_dim", "bias"),
     params=("weight",),
-    signature="(x, weight, eps, bias=0.0) -> Tensor",
+    signature="(x, weight, eps) -> Tensor",
     bench_args=_bench_rmsnorm,
 )
 
@@ -119,6 +114,17 @@ LAYERNORM = OpSpec(
     bench_args=_bench_layernorm,
 )
 
+CHANNEL_L2_NORM = OpSpec(
+    name="channel_l2_norm",
+    dims=("tokens", "hidden"),
+    dtypes=("input", "weight", "compute"),
+    optional_dtypes=("bias",),
+    attributes=("channel_first", "bias", "fused_compatible"),
+    params=("weight", "bias"),
+    signature="(x, weight, bias, eps, *, channel_first, compute_dtype) -> Tensor",
+    doc="Channel L2 normalization with separately rounded scale and affine operations.",
+)
+
 ADARMSNORM = OpSpec(
     name="adarmsnorm",
     dims=("tokens", "hidden", "cond_dim"),
@@ -137,13 +143,6 @@ RMSNORM_SILU_MUL = OpSpec(
     bench_args=_bench_rmsnorm_silu_mul,
 )
 
-
-# Existing implementations normalize the last axis with mean-square epsilon.
-STANDARD_RMSNORM = all_of(
-    implies(attrs.variant.is_set(), attrs.variant.in_({"rms", "gemma"})),
-    implies(attrs.norm_dim.is_set(), attrs.norm_dim == -1),
-    implies(attrs.bias.is_set(), attrs.bias == False),
-)
 
 # FlashInfer RMSNorm requires bf16 input and weight tensors.
 FLASHINFER_RMSNORM = all_of(
@@ -217,19 +216,6 @@ def _torch_rmsnorm(facts, params):
     return _torch_rmsnorm_fn(_gemma(facts))
 
 
-def _torch_rmsnorm_l2(facts, params):
-    import torch.nn.functional as F
-
-    axis = int(facts.lookup("attrs.norm_dim"))
-    scale = int(facts.lookup("shape.hidden")) ** 0.5
-
-    def rmsnorm(x, weight, eps, bias=0.0):
-        # Preserve separate rounding, broadcast parameters and ambient autocast.
-        return F.normalize(x, p=2.0, dim=axis, eps=eps) * scale * weight + bias
-
-    return rmsnorm
-
-
 def _torch_rmsnorm_add(facts, params):
     inner = _torch_rmsnorm_fn(_gemma(facts))
 
@@ -264,6 +250,25 @@ def _torch_layernorm(facts, params):
         return torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
 
     return layernorm
+
+
+def _triton_channel_l2_norm(facts, params):
+    from phyai_kernel import channel_l2_norm
+
+    return channel_l2_norm
+
+
+def _torch_channel_l2_norm(facts, params):
+    import torch.nn.functional as F
+
+    def channel_l2_norm(x, weight, bias, eps, *, channel_first, compute_dtype):
+        value = x if compute_dtype is None else x.to(compute_dtype)
+        dim = 1 if channel_first else -1
+        normalized = F.normalize(value, dim=dim, eps=eps).to(x.dtype)
+        output = normalized * weight.numel() ** 0.5 * weight
+        return output if bias is None else output + bias
+
+    return channel_l2_norm
 
 
 def _triton_adarmsnorm(facts, params):
@@ -307,7 +312,14 @@ def _torch_rmsnorm_silu_mul(facts, params):
 
 
 def register(catalog: Catalog) -> None:
-    for spec in (RMSNORM, RMSNORM_ADD, LAYERNORM, ADARMSNORM, RMSNORM_SILU_MUL):
+    for spec in (
+        RMSNORM,
+        RMSNORM_ADD,
+        LAYERNORM,
+        CHANNEL_L2_NORM,
+        ADARMSNORM,
+        RMSNORM_SILU_MUL,
+    ):
         catalog.register_op(spec)
 
     catalog.register_many(
@@ -317,7 +329,7 @@ def register(catalog: Catalog) -> None:
                 kernel_id="flashinfer.rmsnorm",
                 op="rmsnorm",
                 priority=Priority.OPTIMIZED + 2,
-                when=all_of(FLASHINFER_RMSNORM, STANDARD_RMSNORM),
+                when=FLASHINFER_RMSNORM,
                 prepare=_flashinfer_rmsnorm,
                 # Allocate gamma in the activation dtype.
                 params={"weight": matches_activation()},
@@ -326,7 +338,7 @@ def register(catalog: Catalog) -> None:
                 kernel_id="phyai_kernel.rmsnorm",
                 op="rmsnorm",
                 priority=Priority.OPTIMIZED,
-                when=all_of(TRITON_NORM, STANDARD_RMSNORM),
+                when=TRITON_NORM,
                 prepare=_triton_rmsnorm,
                 params={"weight": any_float()},
             ),
@@ -335,25 +347,8 @@ def register(catalog: Catalog) -> None:
                 op="rmsnorm",
                 priority=Priority.REFERENCE,
                 reference=True,
-                when=all_of(dtype.input.is_set(), STANDARD_RMSNORM),
+                when=dtype.input.is_set(),
                 prepare=_torch_rmsnorm,
-                params={"weight": any_float()},
-            ),
-            Impl(
-                kernel_id="torch.rmsnorm_l2",
-                op="rmsnorm",
-                priority=Priority.REFERENCE,
-                reference=True,
-                when=all_of(
-                    attrs.variant == "l2",
-                    # Optional leaves pass when absent; negate is_none to require an axis.
-                    none_of(attrs.norm_dim.is_none()),
-                    implies(
-                        attrs.bias, dtype.bias.in_({"fp16", "bf16", "fp32", "fp64"})
-                    ),
-                    dtype.input.in_({"fp16", "bf16", "fp32", "fp64"}),
-                ),
-                prepare=_torch_rmsnorm_l2,
                 params={"weight": any_float()},
             ),
             # Fused RMSNorm and residual add.
@@ -409,6 +404,24 @@ def register(catalog: Catalog) -> None:
                 # The reference path accepts any floating affine dtype.
                 params={"weight": any_float(), "bias": any_float()},
             ),
+            # Channel L2 normalization.
+            Impl(
+                kernel_id="phyai_kernel.channel_l2_norm",
+                op="channel_l2_norm",
+                priority=Priority.OPTIMIZED,
+                when=all_of(TRITON_NORM, attrs.fused_compatible),
+                prepare=_triton_channel_l2_norm,
+                params={"weight": any_float(), "bias": any_float()},
+            ),
+            Impl(
+                kernel_id="torch.channel_l2_norm",
+                op="channel_l2_norm",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=dtype.input.is_set(),
+                prepare=_torch_channel_l2_norm,
+                params={"weight": any_float(), "bias": any_float()},
+            ),
             # AdaRMSNorm.
             Impl(
                 kernel_id="phyai_kernel.adarmsnorm",
@@ -448,6 +461,7 @@ def register(catalog: Catalog) -> None:
 __all__ = [
     "ADARMSNORM",
     "LAYERNORM",
+    "CHANNEL_L2_NORM",
     "RMSNORM",
     "RMSNORM_ADD",
     "RMSNORM_SILU_MUL",

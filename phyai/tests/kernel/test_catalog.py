@@ -61,7 +61,7 @@ def _toy_impl(kernel_id: str, when=None, **kwargs) -> Impl:
 
 
 def test_every_declared_module_registers_something(catalog):
-    assert len(OP_MODULES) == 7
+    assert len(OP_MODULES) == 8
     assert len(catalog.ops()) >= len(OP_MODULES)
     for spec in catalog.ops():
         assert catalog.impls(spec.name), f"{spec.name} has no implementations"
@@ -75,7 +75,6 @@ def test_implementations_are_ordered_best_first_whatever_the_registration_order(
         "flashinfer.rmsnorm",
         "phyai_kernel.rmsnorm",
         "torch.rmsnorm",
-        "torch.rmsnorm_l2",
     ]
     priorities = [item.priority for item in rows]
     assert priorities == sorted(priorities, reverse=True)
@@ -181,8 +180,15 @@ def test_manifest_and_describe_render_every_row_stably(catalog):
 
 def test_libraries_and_id_patterns_are_derived_from_the_rows(catalog):
     """The selector must import only what eligibility actually depends on."""
-    assert catalog.libraries() == {"flashinfer", "phyai_kernel", "fla", "flash_qla"}
-    assert catalog.libraries("gemm") == {"flashinfer"}
+    assert catalog.libraries() == {
+        "flashinfer",
+        "phyai_kernel",
+        "triton",
+        "fla",
+        "flash_qla",
+        "humming",
+    }
+    assert catalog.libraries("gemm") == {"flashinfer", "humming"}
     assert catalog.libraries("attention_gdn") == {"flashinfer", "fla", "flash_qla"}
     assert set(catalog.match_ids("flashinfer.gemm.*")) == {
         "flashinfer.gemm.bf16",

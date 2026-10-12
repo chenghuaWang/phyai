@@ -8,11 +8,34 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from tqdm import tqdm
 
-from phyai.layers.layer_norm import RMSNorm
+from phyai.layers.channel_l2_norm import ChannelL2Norm
 from phyai.models.dreamzero.configuration_dreamzero import DreamZeroVAEConfig
 from phyai.weights.shards import replicated
 
 CACHE_T = 2
+
+
+class WanChannelL2Norm(ChannelL2Norm):
+    """Preserve Wan's native reduction and CUDA autocast promotion."""
+
+    def __init__(self, channels: int, *, spatial_dims: int):
+        super().__init__(
+            channels,
+            spatial_dims=spatial_dims,
+            dtype=torch.get_default_dtype(),
+            device="cpu",
+            compute_dtype=None,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # F.normalize promotes low-precision CUDA inputs under autocast. Keep
+        # that precision through the scale and affine operations as Wan does.
+        if torch.is_autocast_enabled(x.device.type) and x.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            x = x.float()
+        return super().forward(x)
 
 
 def attach_replicated_vae_weights(module: nn.Module) -> None:
@@ -240,22 +263,10 @@ class ResidualBlock(nn.Module):
 
         # layers
         self.residual = nn.Sequential(
-            RMSNorm(
-                in_dim,
-                variant="l2",
-                norm_dim=1,
-                affine_shape=(in_dim, 1, 1, 1),
-                device="cpu",
-            ),
+            WanChannelL2Norm(in_dim, spatial_dims=3),
             nn.SiLU(),
             CausalConv3d(in_dim, out_dim, 3, padding=1),
-            RMSNorm(
-                out_dim,
-                variant="l2",
-                norm_dim=1,
-                affine_shape=(out_dim, 1, 1, 1),
-                device="cpu",
-            ),
+            WanChannelL2Norm(out_dim, spatial_dims=3),
             nn.SiLU(),
             nn.Dropout(dropout),
             CausalConv3d(out_dim, out_dim, 3, padding=1),
@@ -297,9 +308,7 @@ class AttentionBlock(nn.Module):
         self.dim = dim
 
         # layers
-        self.norm = RMSNorm(
-            dim, variant="l2", norm_dim=1, affine_shape=(dim, 1, 1), device="cpu"
-        )
+        self.norm = WanChannelL2Norm(dim, spatial_dims=2)
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
 
@@ -484,13 +493,7 @@ class Encoder3d(nn.Module):
 
         # output blocks
         self.head = nn.Sequential(
-            RMSNorm(
-                out_dim,
-                variant="l2",
-                norm_dim=1,
-                affine_shape=(out_dim, 1, 1, 1),
-                device="cpu",
-            ),
+            WanChannelL2Norm(out_dim, spatial_dims=3),
             nn.SiLU(),
             CausalConv3d(out_dim, z_dim, 3, padding=1),
         )
@@ -604,13 +607,7 @@ class Decoder3d(nn.Module):
 
         # output blocks
         self.head = nn.Sequential(
-            RMSNorm(
-                out_dim,
-                variant="l2",
-                norm_dim=1,
-                affine_shape=(out_dim, 1, 1, 1),
-                device="cpu",
-            ),
+            WanChannelL2Norm(out_dim, spatial_dims=3),
             nn.SiLU(),
             CausalConv3d(out_dim, 3, 3, padding=1),
         )

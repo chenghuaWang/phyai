@@ -23,6 +23,7 @@ from phyai.utils import get_logger
 from phyai.utils.cuda import init_cuda, format_gib, init_cublas, available_memory_bytes
 from phyai.kernel.call import freeze_kernel_choices
 from phyai.layers.attention.utils import release_global_fi_workspaces
+from phyai.layers.quant.active import get_active_plan, use_quant_plan
 from phyai.kernel.types import ModelContext
 from phyai.engine_config import EngineConfig, ParallelConfig, init_engine_config
 from phyai.parallel.config import DOMAINS, MODEL_DOMAINS
@@ -379,7 +380,11 @@ class EngineCore:
 
         # 8. Initialize the selected model plugin.
         self.entry = entry_cls()
-        with self._stage("plugin_setup"):
+        quant_plan = self.kernel_selector.policy.quant_plan
+        with (
+            self._stage("plugin_setup"),
+            use_quant_plan(quant_plan if quant_plan is not None else get_active_plan()),
+        ):
             self.entry.setup(args.plugin_args)
         self._model_lock = threading.Lock()
         self._weight_update_lock = threading.Lock()
@@ -832,6 +837,7 @@ from phyai.models.cosmos3 import (  # noqa: E402, F401
     main_cosmos3_policy as _main_cosmos3_policy,
 )
 from phyai.models.gr00t_n17 import main_gr00t_n17 as _main_gr00t_n17  # noqa: E402, F401
+from phyai.models.qwen_image_21 import main_qwen_image_21 as _main_qwen_image_21  # noqa: E402, F401
 from phyai.models.minicpm_gr00t import (  # noqa: E402, F401
     main_minicpm_gr00t as _main_minicpm_gr00t,
 )
