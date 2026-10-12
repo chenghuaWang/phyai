@@ -874,7 +874,7 @@ class WanVideoVAE(nn.Module):
         return mask
 
     def tiled_decode(self, hidden_states, tile_size, tile_stride):
-        _, _, T, H, W = hidden_states.shape
+        batch_size, _, T, H, W = hidden_states.shape
         size_h, size_w = tile_size
         stride_h, stride_w = tile_stride
 
@@ -896,7 +896,13 @@ class WanVideoVAE(nn.Module):
             device=hidden_states.device,
         )
         values = torch.zeros(
-            (1, 3, out_T, H * self.upsampling_factor, W * self.upsampling_factor),
+            (
+                batch_size,
+                3,
+                out_T,
+                H * self.upsampling_factor,
+                W * self.upsampling_factor,
+            ),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
@@ -1011,18 +1017,19 @@ class WanVideoVAE(nn.Module):
         return video.clamp_(-1, 1)
 
     def encode(self, videos, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
+        if tiled:
+            tile_size = (
+                tile_size[0] * self.upsampling_factor,
+                tile_size[1] * self.upsampling_factor,
+            )
+            tile_stride = (
+                tile_stride[0] * self.upsampling_factor,
+                tile_stride[1] * self.upsampling_factor,
+            )
         hidden_states = []
         for video in videos:
             video = video.unsqueeze(0)
             if tiled:
-                tile_size = (
-                    tile_size[0] * self.upsampling_factor,
-                    tile_size[1] * self.upsampling_factor,
-                )
-                tile_stride = (
-                    tile_stride[0] * self.upsampling_factor,
-                    tile_stride[1] * self.upsampling_factor,
-                )
                 hidden_state = self.tiled_encode(video, tile_size, tile_stride)
             else:
                 hidden_state = self.single_encode(video)

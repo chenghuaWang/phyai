@@ -179,6 +179,7 @@ class CLIPAttentionBlock(nn.Module):
                 bias=True,
                 sequence_parallel=False,
                 params_dtype=params_dtype,
+                device="cpu",
                 mesh=encoder_mesh,
             )
         else:
