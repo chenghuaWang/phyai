@@ -210,10 +210,10 @@ class DreamZeroFlowStepper:
         model_output: torch.Tensor,
         sample: torch.Tensor,
         order: int,
-        step_index: int,
+        sigma_t: torch.Tensor,
+        sigma_s0: torch.Tensor,
+        sigma_history: tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
-        if self.sigmas is None:
-            raise RuntimeError("call set_timesteps() before step().")
         model_output_list = self.model_outputs
         m0 = model_output_list[-1]
         if m0 is None:
@@ -226,7 +226,6 @@ class DreamZeroFlowStepper:
             ).prev_sample
             return x_t
 
-        sigma_t, sigma_s0 = self.sigmas[step_index + 1], self.sigmas[step_index]
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
         alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
 
@@ -237,15 +236,14 @@ class DreamZeroFlowStepper:
         rks = []
         D1s = []
         for i in range(1, order):
-            si = step_index - i
             mi = model_output_list[-(i + 1)]
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(sigma_history[i - 1])
             lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
             D1s.append((mi - m0) / rk)
 
-        rks.append(torch.ones((), dtype=self.sigmas.dtype, device=self.sigmas.device))
+        rks.append(torch.ones_like(sigma_s0))
         rks = torch.stack(rks, dim=0)
 
         R = []
@@ -276,7 +274,7 @@ class DreamZeroFlowStepper:
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)
             if order == 2:
-                rhos_p = torch.full((1,), 0.5, dtype=x.dtype, device=self.sigmas.device)
+                rhos_p = torch.full((1,), 0.5, dtype=x.dtype, device=x.device)
             else:
                 rhos_p = torch.linalg.solve_ex(R[:-1, :-1], b[:-1])[0].to(x.dtype)
         else:
@@ -307,10 +305,10 @@ class DreamZeroFlowStepper:
         last_sample: torch.Tensor,
         this_sample: torch.Tensor,
         order: int,
-        step_index: int,
+        sigma_t: torch.Tensor,
+        sigma_s0: torch.Tensor,
+        sigma_history: tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
-        if self.sigmas is None:
-            raise RuntimeError("call set_timesteps() before step().")
         model_output_list = self.model_outputs
         m0 = model_output_list[-1]
         if m0 is None:
@@ -319,7 +317,6 @@ class DreamZeroFlowStepper:
         x_t = this_sample
         model_t = this_model_output
 
-        sigma_t, sigma_s0 = self.sigmas[step_index], self.sigmas[step_index - 1]
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
         alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
 
@@ -330,14 +327,13 @@ class DreamZeroFlowStepper:
         rks = []
         D1s = []
         for i in range(1, order):
-            si = step_index - (i + 1)
             mi = model_output_list[-(i + 1)]
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(sigma_history[i - 1])
             lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
             D1s.append((mi - m0) / rk)
-        rks.append(torch.ones((), dtype=self.sigmas.dtype, device=self.sigmas.device))
+        rks.append(torch.ones_like(sigma_s0))
         rks = torch.stack(rks, dim=0)
 
         R = []
@@ -371,7 +367,7 @@ class DreamZeroFlowStepper:
             D1s = None
 
         if order == 1:
-            rhos_c = torch.full((1,), 0.5, dtype=x.dtype, device=self.sigmas.device)
+            rhos_c = torch.full((1,), 0.5, dtype=x.dtype, device=x.device)
         else:
             rhos_c = torch.linalg.solve_ex(R, b)[0].to(x.dtype)
 
@@ -411,12 +407,18 @@ class DreamZeroFlowStepper:
             step_index=step_index,
         )
         if use_corrector:
+            # Index outside the compiled updates so each step reuses the same
+            # graphs. The corrector's history precedes the previous step.
             sample = self._multistep_uni_c_bh_update(
                 this_model_output=converted,
                 last_sample=self.last_sample,
                 this_sample=sample,
                 order=self.this_order,
-                step_index=step_index,
+                sigma_t=self.sigmas[step_index],
+                sigma_s0=self.sigmas[step_index - 1],
+                sigma_history=tuple(
+                    self.sigmas[step_index - i - 1] for i in range(1, self.this_order)
+                ),
             ).clone()
 
         for i in range(self.solver_order - 1):
@@ -440,7 +442,11 @@ class DreamZeroFlowStepper:
             model_output=model_output,
             sample=sample,
             order=self.this_order,
-            step_index=step_index,
+            sigma_t=self.sigmas[step_index + 1],
+            sigma_s0=self.sigmas[step_index],
+            sigma_history=tuple(
+                self.sigmas[step_index - i] for i in range(1, self.this_order)
+            ),
         ).clone()
         if self.lower_order_nums < self.solver_order:
             self.lower_order_nums += 1
