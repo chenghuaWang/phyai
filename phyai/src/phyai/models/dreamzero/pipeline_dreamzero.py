@@ -168,7 +168,9 @@ class DreamZeroMinimalPipeline:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
-    def encode_text(self, processed: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode_text(
+        self, processed: Any, *, use_cfg: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         context = None
         uncond_context = None
         if self._is_encoder_rank:
@@ -181,24 +183,25 @@ class DreamZeroMinimalPipeline:
                     "encode_positive_prompt",
                     self.text_encoder.encode_prompt,
                 )
-                encode_negative = getattr(
-                    self.text_encoder,
-                    "encode_negative_prompt",
-                    self.text_encoder.encode_prompt,
-                )
                 context = encode_positive(
                     _get_field(processed, "input_ids"),
                     _get_field(processed, "attention_mask"),
                 )
-                uncond_context = encode_negative(
-                    _get_field(processed, "negative_input_ids"),
-                    _get_field(processed, "negative_attention_mask"),
-                )
+                if use_cfg:
+                    encode_negative = getattr(
+                        self.text_encoder,
+                        "encode_negative_prompt",
+                        self.text_encoder.encode_prompt,
+                    )
+                    uncond_context = encode_negative(
+                        _get_field(processed, "negative_input_ids"),
+                        _get_field(processed, "negative_attention_mask"),
+                    )
             finally:
                 self._offload(self.text_encoder.text_encoder)
         return (
             self._broadcast_encoder_tensor(context),
-            self._broadcast_encoder_tensor(uncond_context),
+            self._broadcast_encoder_tensor(uncond_context) if use_cfg else None,
         )
 
     def encode_first_frame_condition(
@@ -363,7 +366,10 @@ class DreamZeroMinimalPipeline:
             device=self.device,
             dtype=self.dtype,
         )
-        context, uncond_context = self.encode_text(processed)
+        use_cfg = (
+            self.config.cfg_scale if guidance_scale is None else guidance_scale
+        ) != 1.0
+        context, uncond_context = self.encode_text(processed, use_cfg=use_cfg)
         start_frame = (
             self.scheduler.current_start_frame
             if current_start_frame is None
@@ -422,9 +428,6 @@ class DreamZeroMinimalPipeline:
             dtype=self.dtype,
         )
         seq_len = self.config.num_frame_per_block * (latent_h // 2) * (latent_w // 2)
-        use_cfg = (
-            self.config.cfg_scale if guidance_scale is None else guidance_scale
-        ) != 1.0
         return DreamZeroRequest(
             video=noise_video,
             action=noise_action,
@@ -439,7 +442,7 @@ class DreamZeroMinimalPipeline:
             y=condition.y,
             clean_video=condition.clean_video,
             reference_video=reference_video,
-            uncond_context=uncond_context if use_cfg else None,
+            uncond_context=uncond_context,
             uncond_clip_feature=condition.clip_feature if use_cfg else None,
             seq_len=seq_len,
             current_start_frame=start_frame,

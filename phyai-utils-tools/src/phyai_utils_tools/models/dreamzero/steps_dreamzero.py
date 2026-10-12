@@ -203,6 +203,16 @@ def select_batch_value(value: Any, index: int, batch_size: int) -> Any:
     return value
 
 
+def select_batch_sequence(value: Any, index: int, batch_size: int) -> Any:
+    """Select state/action samples without interpreting a feature vector as a batch."""
+    if value is None:
+        return None
+    values = as_numpy(value)
+    if values.ndim > 1 and values.shape[0] == batch_size:
+        return values[index]
+    return values
+
+
 def resolve_language(transition: Transition, index: int, batch_size: int) -> Any:
     for key in (
         PROMPT,
@@ -295,6 +305,10 @@ def prepare_state(
         return values, np.zeros_like(values, dtype=bool)
 
     values = as_numpy(state)
+    if values.ndim == 1:
+        values = values[None, :]
+    if values.ndim != 2:
+        raise ValueError(f"State sample must be [D] or [T, D], got {values.shape}.")
     if values.shape[0] % state_horizon != 0:
         raise ValueError(f"{values.shape=}, {state_horizon=}")
     n_state_dims = values.shape[-1]
@@ -319,6 +333,10 @@ def prepare_action(
         return values, np.zeros_like(values, dtype=bool)
 
     values = as_numpy(action)
+    if values.ndim == 1:
+        values = values[None, :]
+    if values.ndim != 2:
+        raise ValueError(f"Action sample must be [D] or [T, D], got {values.shape}.")
     if values.shape[0] % action_horizon != 0:
         raise ValueError(f"{values.shape=}, {action_horizon=}")
     n_action_dims = values.shape[-1]
@@ -654,7 +672,7 @@ class DreamZeroPrepareStep(ProcessorStep):
                 raw_prompt if raw_prompt is not None else self.default_instruction
             )
             negative_prompts.append(self.negative_prompt)
-            state = select_batch_value(transition.get(STATE), index, batch_size)
+            state = select_batch_sequence(transition.get(STATE), index, batch_size)
             state_value, state_mask = prepare_state(
                 state,
                 state_horizon=self.state_horizon,
@@ -663,7 +681,7 @@ class DreamZeroPrepareStep(ProcessorStep):
             state_value = np.clip(state_value, -1.0, 1.0)
             states.append(state_value)
             state_masks.append(state_mask)
-            action = select_batch_value(transition.get(ACTION), index, batch_size)
+            action = select_batch_sequence(transition.get(ACTION), index, batch_size)
             if self.training or (self.include_action_if_present and action is not None):
                 action_value, action_mask = prepare_action(
                     action,
@@ -709,7 +727,7 @@ class DreamZeroTextTokenizeStep(ProcessorStep):
     tokenizer: Any = field(repr=False, default=None)
     max_length: int = 512
     tokenizer_name: str | None = None
-    negative_prompt: str = ""
+    negative_prompt: str = DREAMZERO_DEFAULT_NEGATIVE_PROMPT
     clean: bool = True
     padding: str = "max_length"
     truncation: bool = True
