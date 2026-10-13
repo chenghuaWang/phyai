@@ -25,10 +25,9 @@ def parse_args() -> argparse.Namespace:
             "--tokenizer /path/to/umt5-xxl "
             "--right-image right.png --left-image left.png --wrist-image wrist.png "
             "--state 0 0 0 0 0 0 0 0 --task 'Pick up the object' "
-            "--sequential-cpu-offload --output action.npy. "
+            "--output action.npy. "
             "Replace the sample state with seven measured joint positions and "
-            "one gripper position. This runs a fresh sequence, not a robot control loop. "
-            "CPU offload reduces memory use but does not guarantee the model fits."
+            "one gripper position. This runs a fresh sequence, not a robot control loop."
         ),
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -63,18 +62,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use the 16-step dynamic schedule instead of --steps.",
     )
-    parser.add_argument("--sequential-cpu-offload", action="store_true")
-    parser.add_argument(
-        "--official-attention",
-        action="store_true",
-        help="Use cuDNN-prioritized SDPA self-attention and official FlashAttention 2 cross-attention.",
-    )
     parser.add_argument(
         "--compile-scheduler",
         action="store_true",
         help="Compile UniPC updates to match the official BF16 rounding path.",
     )
-    parser.add_argument("--kernel-config", type=str, help="Kernel policy YAML path.")
+    parser.add_argument(
+        "--kernel-config",
+        type=str,
+        default=str(Path(__file__).with_name("kernels.yaml")),
+        help="Kernel policy YAML path (default: DreamZero FlashInfer FA2 policy).",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -119,11 +117,9 @@ def main() -> None:
                 checkpoint_dir=args.checkpoint,
                 seed=args.seed,
                 weight_strict=True,
-                sequential_cpu_offload=args.sequential_cpu_offload,
                 num_inference_steps=args.steps,
                 dynamic_dit=args.dynamic_dit,
                 dynamic_dit_scheduler_steps=16,
-                official_attention=args.official_attention,
                 compile_scheduler=args.compile_scheduler,
             ),
             config=EngineConfig(

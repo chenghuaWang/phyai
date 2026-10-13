@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from phyai.kernel.facts import lib, attrs, dtype, device
 from phyai.kernel.opspec import Impl, OpSpec, Priority
 from phyai.kernel.registry import Catalog
@@ -51,6 +53,16 @@ def _torch(name: str, *, gated: bool):
             "gelu_tanh": lambda value: torch.nn.functional.gelu(
                 value, approximate="tanh"
             ),
+            "t5_gelu": lambda value: (
+                0.5
+                * value
+                * (
+                    1.0
+                    + torch.tanh(
+                        math.sqrt(2.0 / math.pi) * (value + 0.044715 * value.pow(3.0))
+                    )
+                )
+            ),
         }
         activate = activations[name]
 
@@ -65,6 +77,12 @@ def _torch(name: str, *, gated: bool):
     return prepare
 
 
+def _t5_gelu(facts, params):
+    from phyai_kernel import t5_gelu
+
+    return t5_gelu
+
+
 FLASHINFER_KERNELS = (
     ("silu", "silu_and_mul"),
     ("gelu", "gelu_and_mul"),
@@ -75,6 +93,7 @@ TORCH_KERNELS = (
     ("silu", False, "silu"),
     ("gelu", False, "gelu"),
     ("gelu_tanh", False, "gelu_tanh"),
+    ("t5_gelu", False, "t5_gelu"),
     ("silu", True, "silu_and_mul"),
     ("gelu", True, "gelu_and_mul"),
     ("gelu_tanh", True, "gelu_tanh_and_mul"),
@@ -98,6 +117,27 @@ def register(catalog: Catalog) -> None:
                 },
             )
             for activation, function_name in FLASHINFER_KERNELS
+        )
+        + (
+            Impl(
+                kernel_id="phyai_kernel.activation.t5_gelu",
+                op="activation",
+                priority=Priority.OPTIMIZED,
+                when=all_of(
+                    lib.has("phyai_kernel"),
+                    lib.has("flashinfer"),
+                    device.vendor == "nvidia",
+                    dtype.input.in_({"bf16", "fp16"}),
+                    attrs.activation == "t5_gelu",
+                    attrs.gated == False,
+                ),
+                prepare=_t5_gelu,
+                metadata={
+                    "package": "phyai_kernel",
+                    "activation": "t5_gelu",
+                    "gated": False,
+                },
+            ),
         )
         + tuple(
             Impl(

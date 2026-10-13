@@ -13,12 +13,11 @@ from phyai.models.dreamzero.builder_dreamzero import (
     DreamZeroBuildOptions,
     DreamZeroEncoderStrategy,
     DreamZeroPipelineBundle,
-    build_dreamzero_minimal_pipeline,
+    build_dreamzero_pipeline,
 )
 from phyai.models.dreamzero.image_encoder_wan import (
     DreamZeroWanImageEncoder,
     WanCLIPVisionTransformer,
-    WanXLMRobertaCLIPVisual,
     dreamzero_image_encoder_weight_remap,
 )
 from phyai.models.dreamzero.modeling_dreamzero import (
@@ -29,10 +28,8 @@ from phyai.models.dreamzero.modeling_dreamzero import (
     DreamZeroCrossAttention,
     DreamZeroDiT,
     DreamZeroDiTBlock,
-    DreamZeroMLP,
     DreamZeroSelfAttention,
     DreamZeroSinusoidalPositionalEncoding,
-    dreamzero_component_from_key,
     dreamzero_dit_weight_remap,
 )
 from phyai.models.dreamzero.model_runner_dreamzero import (
@@ -49,29 +46,27 @@ from phyai.models.dreamzero.model_runner_text_encoder_dreamzero import (
 from phyai.models.dreamzero.model_runner_vae_dreamzero import DreamZeroVAERunner
 from phyai.models.dreamzero.pipeline_dreamzero import (
     DreamZeroFirstFrameCondition,
-    DreamZeroMinimalPipeline,
+    DreamZeroPipeline,
     DreamZeroPipelineOutput,
     dreamzero_generate_noise,
     dreamzero_images_to_video_tensor,
 )
-from phyai.models.dreamzero.scheduler_ws1_dreamzero import (
+from phyai.models.dreamzero.scheduler_dreamzero import (
     DreamZeroFlowStepper,
     DreamZeroRequest,
     DreamZeroSchedulerOutput,
-    DreamZeroWS1Scheduler,
+    DreamZeroScheduler,
 )
 from phyai.models.dreamzero.text_encoder_wan import (
     DreamZeroWanTextEncoder,
     T5Attention,
     T5FeedForward,
-    T5LayerNorm,
     T5RelativeEmbedding,
     T5SelfAttention,
     dreamzero_text_encoder_weight_remap,
 )
 from phyai.models.dreamzero.vae_wan import (
     DreamZeroWanVAE,
-    WanVideoVAE,
     dreamzero_vae_weight_remap,
 )
 
@@ -92,12 +87,10 @@ __all__ = [
     "DreamZeroCrossAttention",
     "DreamZeroDiT",
     "DreamZeroDiTBlock",
-    "DreamZeroMLP",
     "DreamZeroSelfAttention",
     "DreamZeroSinusoidalPositionalEncoding",
     "DreamZeroWanImageEncoder",
     "WanCLIPVisionTransformer",
-    "WanXLMRobertaCLIPVisual",
     "DreamZeroDiTForwardBatch",
     "DreamZeroDiTForwardOutput",
     "DreamZeroDiTRunner",
@@ -105,22 +98,19 @@ __all__ = [
     "DreamZeroTextEncoderRunner",
     "DreamZeroVAERunner",
     "DreamZeroFirstFrameCondition",
-    "DreamZeroMinimalPipeline",
+    "DreamZeroPipeline",
     "DreamZeroPipelineOutput",
     "DreamZeroFlowStepper",
     "DreamZeroRequest",
     "DreamZeroSchedulerOutput",
-    "DreamZeroWS1Scheduler",
+    "DreamZeroScheduler",
     "DreamZeroWanTextEncoder",
     "DreamZeroWanVAE",
     "T5Attention",
     "T5FeedForward",
-    "T5LayerNorm",
     "T5RelativeEmbedding",
     "T5SelfAttention",
-    "WanVideoVAE",
-    "build_dreamzero_minimal_pipeline",
-    "dreamzero_component_from_key",
+    "build_dreamzero_pipeline",
     "dreamzero_dit_weight_remap",
     "dreamzero_generate_noise",
     "dreamzero_image_encoder_weight_remap",

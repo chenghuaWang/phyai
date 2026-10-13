@@ -28,11 +28,6 @@ def _dig(data: dict[str, Any], path: str) -> tuple[bool, Any]:
 class DreamZeroDiTConfig(PretrainedConfig):
     """Causal Wan DiT config used by DreamZero's action head."""
 
-    nested_sources = {
-        "pretrained_path": "diffusion_model_pretrained_path",
-    }
-
-    pretrained_path: str | None = None
     dim: int = 5120
     eps: float = 1e-6
     ffn_dim: int = 13824
@@ -40,7 +35,6 @@ class DreamZeroDiTConfig(PretrainedConfig):
     freq_dim: int = 256
     in_dim: int = 36
     max_chunk_size: int = 4
-    model_type: str = "i2v"
     num_action_per_block: int = 24
     num_frame_per_block: int = 2
     num_heads: int = 40
@@ -100,11 +94,6 @@ class DreamZeroDiTConfig(PretrainedConfig):
 class DreamZeroTextEncoderConfig(PretrainedConfig):
     """DreamZero Wan/T5 text encoder checkpoint config."""
 
-    nested_sources = {
-        "pretrained_path": "text_encoder_pretrained_path",
-    }
-
-    pretrained_path: str | None = None
     vocab: int = 256384
     dim: int = 4096
     dim_attn: int = 4096
@@ -113,7 +102,6 @@ class DreamZeroTextEncoderConfig(PretrainedConfig):
     num_layers: int = 24
     num_buckets: int = 32
     shared_pos: bool = False
-    dropout: float = 0.0
     max_length: int = 512
 
     def __post_init__(self) -> None:
@@ -134,8 +122,6 @@ class DreamZeroTextEncoderConfig(PretrainedConfig):
             raise ValueError(f"num_layers={self.num_layers} must be positive.")
         if self.num_buckets <= 0:
             raise ValueError(f"num_buckets={self.num_buckets} must be positive.")
-        if not 0.0 <= self.dropout < 1.0:
-            raise ValueError(f"dropout={self.dropout} must be in [0, 1).")
         if self.max_length <= 0:
             raise ValueError(f"max_length={self.max_length} must be positive.")
 
@@ -148,12 +134,6 @@ class DreamZeroTextEncoderConfig(PretrainedConfig):
 class DreamZeroImageEncoderConfig(PretrainedConfig):
     """DreamZero CLIP/XLM-R image encoder checkpoint config."""
 
-    nested_sources = {
-        "pretrained_path": "image_encoder_pretrained_path",
-    }
-
-    pretrained_path: str | None = None
-    embed_dim: int = 1024
     image_size: int = 224
     patch_size: int = 14
     vision_dim: int = 1280
@@ -164,9 +144,6 @@ class DreamZeroImageEncoderConfig(PretrainedConfig):
     vision_pre_norm: bool = True
     vision_post_norm: bool = False
     activation: str = "gelu"
-    attn_dropout: float = 0.0
-    proj_dropout: float = 0.0
-    embedding_dropout: float = 0.0
     norm_eps: float = 1e-5
     num_channels: int = 3
     feature_layer: int = 31
@@ -203,8 +180,8 @@ class DreamZeroImageEncoderConfig(PretrainedConfig):
             raise ValueError(f"unsupported vision_pool={self.vision_pool!r}.")
         if self.activation not in {"quick_gelu", "gelu", "swi_glu"}:
             raise ValueError(f"unsupported activation={self.activation!r}.")
-        if self.num_channels <= 0:
-            raise ValueError(f"num_channels={self.num_channels} must be positive.")
+        if self.num_channels != 3:
+            raise ValueError("DreamZero CLIP requires three RGB channels.")
 
     @property
     def num_patches(self) -> int:
@@ -219,17 +196,14 @@ class DreamZeroImageEncoderConfig(PretrainedConfig):
 class DreamZeroVAEConfig(PretrainedConfig):
     """DreamZero Wan2.1 VAE checkpoint config."""
 
-    nested_sources = {
-        "pretrained_path": "vae_pretrained_path",
-    }
+    nested_sources = {"temporal_downsample": "temperal_downsample"}
 
-    pretrained_path: str | None = None
     z_dim: int = 16
     base_dim: int = 96
     decoder_base_dim: int = 96
     dim_mult: tuple[int, ...] = (1, 2, 4, 4)
     num_res_blocks: int = 2
-    temperal_downsample: tuple[bool, ...] = (False, True, True)
+    temporal_downsample: tuple[bool, ...] = (False, True, True)
     out_channels: int = 3
     patch_size: int = 1
     scale_factor_temporal: int = 4
@@ -238,9 +212,9 @@ class DreamZeroVAEConfig(PretrainedConfig):
     def __post_init__(self) -> None:
         if not isinstance(self.dim_mult, tuple):
             object.__setattr__(self, "dim_mult", tuple(self.dim_mult))
-        if not isinstance(self.temperal_downsample, tuple):
+        if not isinstance(self.temporal_downsample, tuple):
             object.__setattr__(
-                self, "temperal_downsample", tuple(self.temperal_downsample)
+                self, "temporal_downsample", tuple(self.temporal_downsample)
             )
         if self.z_dim <= 0:
             raise ValueError(f"z_dim={self.z_dim} must be positive.")
@@ -262,17 +236,30 @@ class DreamZeroVAEConfig(PretrainedConfig):
             raise ValueError(
                 f"scale_factor_spatial={self.scale_factor_spatial} must be positive."
             )
-
-    @property
-    def is_wan21(self) -> bool:
-        return (
-            self.z_dim == 16
-            and self.base_dim == 96
-            and self.decoder_base_dim == 96
-            and self.out_channels == 3
-            and self.patch_size == 1
-            and self.scale_factor_spatial == 8
-        )
+        if self.z_dim != 16 or self.out_channels != 3 or self.patch_size != 1:
+            raise ValueError(
+                "Wan2.1 requires z_dim=16, out_channels=3, and patch_size=1."
+            )
+        if self.decoder_base_dim != self.base_dim:
+            raise ValueError("Wan2.1 encoder and decoder must use the same base_dim.")
+        if len(self.dim_mult) < 2 or any(value <= 0 for value in self.dim_mult):
+            raise ValueError("dim_mult must contain at least two positive multipliers.")
+        if self.num_res_blocks <= 0:
+            raise ValueError("num_res_blocks must be positive.")
+        if len(self.temporal_downsample) != len(self.dim_mult) - 1:
+            raise ValueError(
+                "temporal_downsample must have one entry per downsampling stage."
+            )
+        if self.scale_factor_spatial != 2 ** (len(self.dim_mult) - 1):
+            raise ValueError(
+                "scale_factor_spatial must match the VAE downsampling stages."
+            )
+        if self.scale_factor_temporal != 2 ** sum(self.temporal_downsample):
+            raise ValueError("scale_factor_temporal must match temporal_downsample.")
+        if self.scale_factor_temporal != 4:
+            raise ValueError(
+                "DreamZero requires temporal downsampling by a factor of four."
+            )
 
 
 @dataclass(frozen=True)
@@ -290,15 +277,12 @@ class DreamZeroConfig(PretrainedConfig):
         ),
         "max_action_dim": "action_head_cfg.config.max_action_dim",
         "max_state_dim": "action_head_cfg.config.max_state_dim",
-        "hidden_size": "action_head_cfg.config.hidden_size",
-        "input_embedding_dim": "action_head_cfg.config.input_embedding_dim",
         "num_frames": "action_head_cfg.config.num_frames",
         "num_inference_timesteps": "action_head_cfg.config.num_inference_timesteps",
         "num_timestep_buckets": "action_head_cfg.config.num_timestep_buckets",
         "num_frame_per_block": "action_head_cfg.config.num_frame_per_block",
         "cfg_scale": "action_head_cfg.config.cfg_scale",
         "sigma_shift": "action_head_cfg.config.sigma_shift",
-        "noise_s": "action_head_cfg.config.noise_s",
         "decouple_inference_noise": "action_head_cfg.config.decouple_inference_noise",
         "video_inference_final_noise": (
             "action_head_cfg.config.video_inference_final_noise"
@@ -328,14 +312,12 @@ class DreamZeroConfig(PretrainedConfig):
     max_action_dim: int = 32
     max_state_dim: int = 64
     hidden_size: int = 1024
-    input_embedding_dim: int = 1536
     num_frames: int = 33
     num_inference_timesteps: int = 4
     num_timestep_buckets: int = 1000
     num_frame_per_block: int = 2
     cfg_scale: float = 5.0
     sigma_shift: float = 5.0
-    noise_s: float = 0.999
     decouple_inference_noise: bool = False
     video_inference_final_noise: float = 0.8
 
@@ -344,9 +326,6 @@ class DreamZeroConfig(PretrainedConfig):
     tile_size_width: int = 34
     tile_stride_height: int = 18
     tile_stride_width: int = 16
-
-    torch_dtype: str = "bfloat16"
-    model_dtype: str = "float32"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DreamZeroConfig":
@@ -358,7 +337,10 @@ class DreamZeroConfig(PretrainedConfig):
         # Upstream top-level hidden_size belongs to the VLA backbone and is 0
         # for DreamZero-DROID. The DiT action/state MLP hidden is owned by
         # CausalWanModel and defaults to 1024 when absent from the config.
-        data["hidden_size"] = int(value) if found else 1024
+        if found:
+            data["hidden_size"] = int(value)
+        elif "action_head_cfg" in data:
+            data["hidden_size"] = 1024
         return super().from_dict(data)
 
     def __post_init__(self) -> None:
@@ -373,6 +355,8 @@ class DreamZeroConfig(PretrainedConfig):
             )
         if self.max_state_dim <= 0:
             raise ValueError(f"max_state_dim={self.max_state_dim} must be positive.")
+        if self.hidden_size <= 0:
+            raise ValueError(f"hidden_size={self.hidden_size} must be positive.")
         if self.num_frames <= 0:
             raise ValueError(f"num_frames={self.num_frames} must be positive.")
         if (

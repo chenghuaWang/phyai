@@ -14,7 +14,7 @@ from phyai.models.dreamzero.builder_dreamzero import (
     DreamZeroBuildOptions,
     DreamZeroEncoderStrategy,
     DreamZeroPipelineBundle,
-    build_dreamzero_minimal_pipeline,
+    build_dreamzero_pipeline,
 )
 from phyai.models.dreamzero.configuration_dreamzero import DreamZeroConfig
 from phyai.models.dreamzero.pipeline_dreamzero import DreamZeroPipelineOutput
@@ -22,28 +22,26 @@ from phyai.models.dreamzero.pipeline_dreamzero import DreamZeroPipelineOutput
 
 @dataclass
 class DreamZeroArgs(EntryArgs):
-    """Args bundle for the DreamZero minimal inference plugin."""
+    """Model and request options for DreamZero inference."""
 
     checkpoint_dir: str | Path | None = None
     config: DreamZeroConfig | None = None
     seed: int | None = None
     weight_strict: bool = True
     progress: bool | None = None
-    encoder_strategy: DreamZeroEncoderStrategy = "replicated"
+    encoder_strategy: DreamZeroEncoderStrategy = "tensor_parallel"
     use_cfg_runner: bool = True
     image_use_cuda_graph: bool = False
     image_graph_batch_size: int = 1
-    sequential_cpu_offload: bool = False
     num_inference_steps: int | None = None
     dynamic_dit: bool = False
     dynamic_dit_scheduler_steps: int = 16
-    official_attention: bool = False
     compile_scheduler: bool = False
 
 
 @Engine.register
 class DreamZeroEntry(Entry):
-    """DreamZero minimal pipeline entry.
+    """DreamZero inference entry.
 
     Requests must already be preprocessed by ``phyai-utils-tools`` or an
     equivalent caller-owned processor. The main ``phyai`` package deliberately
@@ -94,7 +92,7 @@ class DreamZeroEntry(Entry):
         self.dynamic_dit = args.dynamic_dit
         self.dynamic_dit_scheduler_steps = args.dynamic_dit_scheduler_steps
         eng = get_engine_config()
-        self.bundle = build_dreamzero_minimal_pipeline(
+        self.bundle = build_dreamzero_pipeline(
             DreamZeroBuildOptions(
                 checkpoint_dir=args.checkpoint_dir,
                 config=args.config,
@@ -105,10 +103,9 @@ class DreamZeroEntry(Entry):
                 progress=args.progress,
                 use_cfg_runner=args.use_cfg_runner,
                 encoder_strategy=args.encoder_strategy,
-                image_use_cuda_graph=args.image_use_cuda_graph,
+                image_use_cuda_graph=args.image_use_cuda_graph
+                and eng.runtime.use_cuda_graph,
                 image_graph_batch_size=args.image_graph_batch_size,
-                sequential_cpu_offload=args.sequential_cpu_offload,
-                official_attention=args.official_attention,
                 compile_scheduler=args.compile_scheduler,
             )
         )
@@ -125,6 +122,8 @@ class DreamZeroEntry(Entry):
             )
 
     def close(self) -> None:
+        if self.bundle is not None:
+            self.bundle.pipeline.close()
         self.bundle = None
         self.num_inference_steps = None
         self.dynamic_dit = False

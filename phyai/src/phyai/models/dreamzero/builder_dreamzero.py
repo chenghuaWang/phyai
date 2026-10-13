@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Literal
 
@@ -11,6 +12,9 @@ import torch.distributed as dist
 import torch.nn as nn
 
 import phyai.parallel as P
+from phyai.engine_config import ParallelConfig
+from phyai.parallel.layout import build_rank_layout
+from phyai.parallel.mesh import Mesh
 from phyai.models.dreamzero.configuration_dreamzero import DreamZeroConfig
 from phyai.models.dreamzero.image_encoder_wan import (
     DreamZeroWanImageEncoder,
@@ -27,8 +31,8 @@ from phyai.models.dreamzero.modeling_dreamzero import (
     DreamZeroDiT,
     dreamzero_dit_weight_remap,
 )
-from phyai.models.dreamzero.pipeline_dreamzero import DreamZeroMinimalPipeline
-from phyai.models.dreamzero.scheduler_ws1_dreamzero import DreamZeroWS1Scheduler
+from phyai.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
+from phyai.models.dreamzero.scheduler_dreamzero import DreamZeroScheduler
 from phyai.models.dreamzero.text_encoder_wan import (
     DreamZeroWanTextEncoder,
     dreamzero_text_encoder_weight_remap,
@@ -43,12 +47,12 @@ from phyai.weights import LoadReport, load_pretrained
 
 logger = get_logger(__name__)
 
-DreamZeroEncoderStrategy = Literal["replicated", "rank0_broadcast"]
+DreamZeroEncoderStrategy = Literal["tensor_parallel", "rank0_broadcast"]
 
 
 @dataclass
 class DreamZeroPipelineBundle:
-    """Objects created for the minimal DreamZero inference path."""
+    """Models, runners, and loading reports for DreamZero inference."""
 
     config: DreamZeroConfig
     dit: nn.Module
@@ -58,8 +62,8 @@ class DreamZeroPipelineBundle:
     text_runner: DreamZeroTextEncoderRunner | None
     image_runner: DreamZeroImageEncoderRunner | None
     vae_runner: DreamZeroVAERunner | None
-    scheduler: DreamZeroWS1Scheduler
-    pipeline: DreamZeroMinimalPipeline
+    scheduler: DreamZeroScheduler
+    pipeline: DreamZeroPipeline
     load_reports: dict[str, LoadReport]
 
 
@@ -76,89 +80,74 @@ class DreamZeroBuildOptions:
     progress: bool | None = None
     attn_backend: str | None = None
     norm_backend: str | None = None
-    official_attention: bool = False
     compile_scheduler: bool = False
     use_cfg_runner: bool = True
-    encoder_strategy: DreamZeroEncoderStrategy = "replicated"
+    encoder_strategy: DreamZeroEncoderStrategy = "tensor_parallel"
     image_use_cuda_graph: bool = False
     image_graph_batch_size: int = 1
     setup_scheduler: bool = True
     setup_encoders: bool = True
-    sequential_cpu_offload: bool = False
 
 
-def _load_component(
-    model: nn.Module,
-    checkpoint_dir: Path,
-    *,
-    remap,
-    strict: bool,
-    progress: bool | None,
-) -> LoadReport:
-    return load_pretrained(
-        model,
-        checkpoint_dir,
-        remap=remap,
-        strict=strict,
-        progress=progress,
-    )
-
-
-def build_dreamzero_minimal_pipeline(
+def build_dreamzero_pipeline(
     options: DreamZeroBuildOptions,
 ) -> DreamZeroPipelineBundle:
-    """Build real DreamZero components and connect the minimal pipeline.
+    """Load DreamZero components and connect their inference runners.
 
-    This function assumes process-level distributed state is already set up
-    when tensor parallelism is desired. In normal serving that means the
-    caller uses :class:`phyai.engine.Engine`; in standalone scripts it means
-    initializing ``phyai.parallel`` before calling this builder.
+    Initialize ``phyai.parallel`` before calling this builder. The Engine
+    handles that setup when constructing a DreamZero entry.
     """
 
-    if options.encoder_strategy not in ("replicated", "rank0_broadcast"):
+    if options.encoder_strategy not in ("tensor_parallel", "rank0_broadcast"):
         raise ValueError(
-            "encoder_strategy must be 'replicated' or 'rank0_broadcast'; "
+            "encoder_strategy must be 'tensor_parallel' or 'rank0_broadcast'; "
             f"got {options.encoder_strategy!r}."
         )
-
     checkpoint_dir = Path(options.checkpoint_dir)
     config = options.config or load_config(checkpoint_dir, DreamZeroConfig)
     device = torch.device(options.device)
     dtype = options.dtype
-    model_device = torch.device("cpu") if options.sequential_cpu_offload else device
     encoder_rank = (
         not dist.is_available()
         or not dist.is_initialized()
-        or options.encoder_strategy == "replicated"
+        or options.encoder_strategy == "tensor_parallel"
         or P.default_mesh().group_rank("world") == 0
     )
 
     dit = DreamZeroDiT(
         config,
         params_dtype=dtype,
-        device=model_device,
-        attn_backend="official" if options.official_attention else options.attn_backend,
+        device=device,
+        attn_backend=options.attn_backend,
         norm_backend=options.norm_backend,
     ).eval()
     if encoder_rank:
+        encoder_mesh = (
+            P.default_mesh()
+            if options.encoder_strategy == "tensor_parallel"
+            else Mesh(build_rank_layout(ParallelConfig()), name="dreamzero_encoders")
+        )
         text_encoder = DreamZeroWanTextEncoder(
             config.text_encoder,
             params_dtype=dtype,
+            device=device,
+            mesh=encoder_mesh,
         ).eval()
         image_encoder = DreamZeroWanImageEncoder(
             config.image_encoder,
-            # Match the official CLIP load path before the cast below. Direct
-            # BF16 construction changes full-graph Inductor numerics on Thor.
+            # Preserve the checkpoint's FP32 construction before the BF16 cast.
             params_dtype=torch.float32,
+            device=device,
+            mesh=encoder_mesh,
         ).eval()
-        vae = DreamZeroWanVAE(config.vae).eval()
+        vae = DreamZeroWanVAE(config.vae, device=device).eval()
     else:
         text_encoder = nn.Identity()
         image_encoder = nn.Identity()
         vae = nn.Identity()
 
     load_reports = {
-        "dit": _load_component(
+        "dit": load_pretrained(
             dit,
             checkpoint_dir,
             remap=dreamzero_dit_weight_remap,
@@ -168,21 +157,23 @@ def build_dreamzero_minimal_pipeline(
     }
     if encoder_rank:
         load_reports.update(
-            text_encoder=_load_component(
+            text_encoder=load_pretrained(
                 text_encoder,
                 checkpoint_dir,
                 remap=dreamzero_text_encoder_weight_remap,
                 strict=options.weight_strict,
                 progress=options.progress,
             ),
-            image_encoder=_load_component(
+            image_encoder=load_pretrained(
                 image_encoder,
                 checkpoint_dir,
-                remap=dreamzero_image_encoder_weight_remap,
+                remap=partial(
+                    dreamzero_image_encoder_weight_remap, config=config.image_encoder
+                ),
                 strict=options.weight_strict,
                 progress=options.progress,
             ),
-            vae=_load_component(
+            vae=load_pretrained(
                 vae,
                 checkpoint_dir,
                 remap=dreamzero_vae_weight_remap,
@@ -191,14 +182,9 @@ def build_dreamzero_minimal_pipeline(
             ),
         )
 
-    if options.sequential_cpu_offload:
-        text_encoder = text_encoder.to(device="cpu", dtype=dtype).eval()
-        image_encoder = image_encoder.to(device="cpu", dtype=dtype).eval()
-        vae = vae.to(device="cpu", dtype=dtype).eval()
-    else:
-        text_encoder = text_encoder.to(device=device, dtype=dtype).eval()
-        image_encoder = image_encoder.to(device=device, dtype=dtype).eval()
-        vae = vae.to(device=device, dtype=dtype).eval()
+    text_encoder = text_encoder.to(dtype=dtype).eval()
+    image_encoder = image_encoder.to(dtype=dtype).eval()
+    vae = vae.to(dtype=dtype).eval()
 
     text_runner = (
         DreamZeroTextEncoderRunner(text_encoder, device=device, dtype=dtype)
@@ -228,7 +214,7 @@ def build_dreamzero_minimal_pipeline(
         image_runner.setup()
         vae_runner.setup()
 
-    scheduler = DreamZeroWS1Scheduler(
+    scheduler = DreamZeroScheduler(
         dit,
         device=device,
         use_cfg_runner=options.use_cfg_runner,
@@ -237,7 +223,7 @@ def build_dreamzero_minimal_pipeline(
     if options.setup_scheduler:
         scheduler.setup()
 
-    pipeline = DreamZeroMinimalPipeline(
+    pipeline = DreamZeroPipeline(
         config=config,
         text_encoder=text_runner,
         image_encoder=image_runner,
@@ -246,12 +232,11 @@ def build_dreamzero_minimal_pipeline(
         device=device,
         dtype=dtype,
         seed=options.seed,
-        sequential_cpu_offload=options.sequential_cpu_offload,
         encoder_rank0_broadcast=options.encoder_strategy == "rank0_broadcast",
     )
 
     logger.info_rank0(
-        "DreamZero minimal pipeline ready from %s (dtype=%s, encoder_strategy=%s).",
+        "DreamZero pipeline ready from %s (dtype=%s, encoder_strategy=%s).",
         checkpoint_dir,
         dtype,
         options.encoder_strategy,
@@ -275,5 +260,5 @@ __all__ = [
     "DreamZeroBuildOptions",
     "DreamZeroEncoderStrategy",
     "DreamZeroPipelineBundle",
-    "build_dreamzero_minimal_pipeline",
+    "build_dreamzero_pipeline",
 ]

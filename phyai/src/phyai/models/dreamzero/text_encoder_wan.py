@@ -6,18 +6,20 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from phyai.layers.linear import ReplicatedLinear
+from phyai.engine_config import ParallelConfig, get_engine_config
+from phyai.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from phyai.layers import RMSNorm, T5GELU
+from phyai.layers.attention.nocache.layer import Attention
+from phyai.layers.vocab_embedding import VocabParallelEmbedding
 from phyai.models.dreamzero.configuration_dreamzero import DreamZeroTextEncoderConfig
-from phyai.weights.shards import replicated
-
-
-def attach_replicated_text_encoder_weights(module: nn.Module) -> None:
-    """Attach phyai weight-loader metadata to all text encoder parameters."""
-    for name, param in module.named_parameters():
-        param.hf_keys = [(name, None)]
-        param.weight_loader = replicated()
+from phyai.parallel.layout import build_rank_layout
+from phyai.parallel.mesh import Mesh
+from phyai.parallel.state import resolve_mesh
 
 
 def dreamzero_text_encoder_weight_remap(name: str) -> str | None:
@@ -31,69 +33,29 @@ def dreamzero_text_encoder_weight_remap(name: str) -> str | None:
     return None
 
 
-def fp16_clamp(x: torch.Tensor) -> torch.Tensor:
-    if x.dtype == torch.float16 and torch.isinf(x).any():
-        clamp = torch.finfo(x.dtype).max - 1000
-        x = torch.clamp(x, min=-clamp, max=clamp)
-    return x
-
-
-class T5GELU(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (
-            0.5
-            * x
-            * (
-                1.0
-                + torch.tanh(
-                    math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))
-                )
-            )
-        )
-
-
-class T5LayerNorm(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        eps: float = 1e-6,
-        *,
-        params_dtype: torch.dtype | None = None,
-        device: torch.device | str | None = None,
-    ) -> None:
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=params_dtype, device=device))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        if self.weight.dtype in {torch.float16, torch.bfloat16}:
-            x = x.type_as(self.weight)
-        return self.weight * x
-
-
 class T5RelativeEmbedding(nn.Module):
     def __init__(
         self,
         num_buckets: int,
         num_heads: int,
-        bidirectional: bool,
         max_dist: int = 128,
         *,
         params_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
+        mesh: Mesh | str = "model",
+        prefix: str,
     ) -> None:
         super().__init__()
         self.num_buckets = num_buckets
-        self.num_heads = num_heads
-        self.bidirectional = bidirectional
         self.max_dist = max_dist
-        self.embedding = nn.Embedding(
+        self.embedding = VocabParallelEmbedding(
             num_buckets,
             num_heads,
-            dtype=params_dtype,
+            padding_multiple=1,
+            params_dtype=params_dtype,
             device=device,
+            mesh=mesh,
+            prefix=f"{prefix}.embedding",
         )
 
     def forward(self, lq: int, lk: int) -> torch.Tensor:
@@ -106,14 +68,9 @@ class T5RelativeEmbedding(nn.Module):
         return rel_pos_embeds.permute(2, 0, 1).unsqueeze(0).contiguous()
 
     def relative_position_bucket(self, rel_pos: torch.Tensor) -> torch.Tensor:
-        if self.bidirectional:
-            num_buckets = self.num_buckets // 2
-            rel_buckets = (rel_pos > 0).long() * num_buckets
-            rel_pos = torch.abs(rel_pos)
-        else:
-            num_buckets = self.num_buckets
-            rel_buckets = 0
-            rel_pos = -torch.min(rel_pos, torch.zeros_like(rel_pos))
+        num_buckets = self.num_buckets // 2
+        rel_buckets = (rel_pos > 0).long() * num_buckets
+        rel_pos = torch.abs(rel_pos)
 
         max_exact = num_buckets // 2
         rel_pos_large = (
@@ -138,50 +95,67 @@ class T5Attention(nn.Module):
         dim: int,
         dim_attn: int,
         num_heads: int,
-        dropout: float = 0.0,
         *,
         params_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
+        mesh: Mesh | str = "model",
+        prefix: str,
     ) -> None:
         if dim_attn % num_heads != 0:
             raise ValueError(
                 f"dim_attn={dim_attn} must be divisible by num_heads={num_heads}."
             )
         super().__init__()
-        self.dim = dim
-        self.dim_attn = dim_attn
-        self.num_heads = num_heads
+        mesh = resolve_mesh(mesh)
+        tp_size = mesh.group_size("dense_tp")
+        if num_heads % tp_size:
+            raise ValueError(
+                f"num_heads={num_heads} must be divisible by tp_size={tp_size}."
+            )
+        self.num_heads = num_heads // tp_size
         self.head_dim = dim_attn // num_heads
-        device = torch.get_default_device() if device is None else device
+        self.head_start = mesh.group_rank("dense_tp") * self.num_heads
         params_dtype = (
             torch.get_default_dtype() if params_dtype is None else params_dtype
         )
-        self.q = ReplicatedLinear(
-            dim, dim_attn, bias=False, params_dtype=params_dtype, device=device
+        self.qkv = QKVParallelLinear(
+            dim,
+            self.head_dim,
+            num_heads,
+            bias=False,
+            group="dense_tp",
+            params_dtype=params_dtype,
+            device=device,
+            mesh=mesh,
+            hf_legs={"q": "q", "k": "k", "v": "v"},
+            prefix=f"{prefix}.qkv",
         )
-        self.k = ReplicatedLinear(
-            dim, dim_attn, bias=False, params_dtype=params_dtype, device=device
+        self.o = RowParallelLinear(
+            dim_attn,
+            dim,
+            bias=False,
+            params_dtype=params_dtype,
+            device=device,
+            mesh=mesh,
+            prefix=f"{prefix}.o",
         )
-        self.v = ReplicatedLinear(
-            dim, dim_attn, bias=False, params_dtype=params_dtype, device=device
+        self.attention = Attention(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scale=1.0,
+            causal=False,
+            kernel_role="dreamzero.text_attention",
         )
-        self.o = ReplicatedLinear(
-            dim_attn, dim, bias=False, params_dtype=params_dtype, device=device
-        )
-        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
         x: torch.Tensor,
-        context: torch.Tensor | None = None,
+        *,
         mask: torch.Tensor | None = None,
         pos_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        context = x if context is None else context
         batch_size = x.size(0)
-        q, _ = self.q(x)
-        k, _ = self.k(context)
-        v, _ = self.v(context)
+        q, k, v = self.qkv(x)[0].chunk(3, dim=-1)
         q = q.view(batch_size, -1, self.num_heads, self.head_dim)
         k = k.view(batch_size, -1, self.num_heads, self.head_dim)
         v = v.view(batch_size, -1, self.num_heads, self.head_dim)
@@ -193,7 +167,7 @@ class T5Attention(nn.Module):
             k.size(1),
         )
         if pos_bias is not None:
-            attn_bias += pos_bias
+            attn_bias += pos_bias[:, self.head_start : self.head_start + self.num_heads]
         if mask is not None:
             if mask.ndim not in {2, 3}:
                 raise ValueError(
@@ -207,20 +181,10 @@ class T5Attention(nn.Module):
                 torch.finfo(x.dtype).min,
             )
 
-        attn = torch.einsum("binc,bjnc->bnij", q, k) + attn_bias
-        attn = F.softmax(attn.float(), dim=-1).type_as(attn)
-        out = torch.einsum("bnij,bjnc->binc", attn, v)
-        out = out.reshape(batch_size, -1, self.dim_attn)
+        out = self.attention(q, k, v, attn_bias=attn_bias)
+        out = out.reshape(batch_size, -1, self.num_heads * self.head_dim)
         out, _ = self.o(out)
-        return self.dropout(out)
-
-
-class T5Gate(nn.Sequential):
-    """Preserve gate checkpoint indices while unpacking the linear output."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self[0](x)
-        return self[1](x)
+        return out
 
 
 class T5FeedForward(nn.Module):
@@ -228,38 +192,42 @@ class T5FeedForward(nn.Module):
         self,
         dim: int,
         dim_ffn: int,
-        dropout: float = 0.0,
         *,
         params_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
+        mesh: Mesh | str = "model",
+        prefix: str,
     ) -> None:
         super().__init__()
-        self.dim = dim
-        self.dim_ffn = dim_ffn
-        device = torch.get_default_device() if device is None else device
         params_dtype = (
             torch.get_default_dtype() if params_dtype is None else params_dtype
         )
-        self.gate = T5Gate(
-            ReplicatedLinear(
-                dim, dim_ffn, bias=False, params_dtype=params_dtype, device=device
-            ),
-            T5GELU(),
+        self.gate_up = MergedColumnParallelLinear(
+            dim,
+            [dim_ffn, dim_ffn],
+            bias=False,
+            params_dtype=params_dtype,
+            device=device,
+            mesh=mesh,
+            hf_legs=("gate.0", "fc1"),
+            prefix=f"{prefix}.gate_up",
         )
-        self.fc1 = ReplicatedLinear(
-            dim, dim_ffn, bias=False, params_dtype=params_dtype, device=device
+        self.activation = T5GELU()
+        self.fc2 = RowParallelLinear(
+            dim_ffn,
+            dim,
+            bias=False,
+            params_dtype=params_dtype,
+            device=device,
+            mesh=mesh,
+            prefix=f"{prefix}.fc2",
         )
-        self.fc2 = ReplicatedLinear(
-            dim_ffn, dim, bias=False, params_dtype=params_dtype, device=device
-        )
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden, _ = self.fc1(x)
-        x = hidden * self.gate(x)
-        x = self.dropout(x)
+        gate, hidden = self.gate_up(x)[0].chunk(2, dim=-1)
+        x = hidden * self.activation(gate)
         x, _ = self.fc2(x)
-        return self.dropout(x)
+        return x
 
 
 class T5SelfAttention(nn.Module):
@@ -269,25 +237,50 @@ class T5SelfAttention(nn.Module):
         *,
         params_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
+        mesh: Mesh | str = "model",
+        position_mesh: Mesh | str = "model",
+        prefix: str,
     ) -> None:
         super().__init__()
         self.shared_pos = config.shared_pos
-        self.norm1 = T5LayerNorm(config.dim, params_dtype=params_dtype, device=device)
+        # UMT5 can overflow FP16 residuals; BF16 needs no saturation.
+        self.residual_clamp = (
+            nn.Hardtanh(-64504.0, 64504.0)
+            if params_dtype == torch.float16
+            else nn.Identity()
+        )
+        self.norm1 = RMSNorm(
+            config.dim,
+            eps=1e-6,
+            dtype=params_dtype,
+            device=device,
+            cast_before_affine=True,
+            prefix=f"{prefix}.norm1",
+        )
         self.attn = T5Attention(
             config.dim,
             config.dim_attn,
             config.num_heads,
-            config.dropout,
             params_dtype=params_dtype,
             device=device,
+            mesh=mesh,
+            prefix=f"{prefix}.attn",
         )
-        self.norm2 = T5LayerNorm(config.dim, params_dtype=params_dtype, device=device)
+        self.norm2 = RMSNorm(
+            config.dim,
+            eps=1e-6,
+            dtype=params_dtype,
+            device=device,
+            cast_before_affine=True,
+            prefix=f"{prefix}.norm2",
+        )
         self.ffn = T5FeedForward(
             config.dim,
             config.dim_ffn,
-            config.dropout,
             params_dtype=params_dtype,
             device=device,
+            mesh=mesh,
+            prefix=f"{prefix}.ffn",
         )
         self.pos_embedding = (
             None
@@ -295,9 +288,10 @@ class T5SelfAttention(nn.Module):
             else T5RelativeEmbedding(
                 config.num_buckets,
                 config.num_heads,
-                bidirectional=True,
                 params_dtype=params_dtype,
                 device=device,
+                mesh=position_mesh,
+                prefix=f"{prefix}.pos_embedding",
             )
         )
 
@@ -313,30 +307,8 @@ class T5SelfAttention(nn.Module):
             if self.pos_embedding is None:
                 raise RuntimeError("missing block-local position embedding.")
             e = self.pos_embedding(x.size(1), x.size(1))
-        x = fp16_clamp(x + self.attn(self.norm1(x), mask=mask, pos_bias=e))
-        return fp16_clamp(x + self.ffn(self.norm2(x)))
-
-
-def init_weights(module: nn.Module) -> None:
-    if isinstance(module, T5LayerNorm):
-        nn.init.ones_(module.weight)
-    elif isinstance(module, T5FeedForward):
-        nn.init.normal_(module.gate[0].weight, std=module.dim**-0.5)
-        nn.init.normal_(module.fc1.weight, std=module.dim**-0.5)
-        nn.init.normal_(module.fc2.weight, std=module.dim_ffn**-0.5)
-    elif isinstance(module, T5Attention):
-        nn.init.normal_(module.q.weight, std=(module.dim * module.dim_attn) ** -0.5)
-        nn.init.normal_(module.k.weight, std=module.dim**-0.5)
-        nn.init.normal_(module.v.weight, std=module.dim**-0.5)
-        nn.init.normal_(
-            module.o.weight,
-            std=(module.num_heads * module.dim_attn) ** -0.5,
-        )
-    elif isinstance(module, T5RelativeEmbedding):
-        nn.init.normal_(
-            module.embedding.weight,
-            std=(2 * module.num_buckets * module.num_heads) ** -0.5,
-        )
+        x = self.residual_clamp(x + self.attn(self.norm1(x), mask=mask, pos_bias=e))
+        return self.residual_clamp(x + self.ffn(self.norm2(x)))
 
 
 class DreamZeroWanTextEncoder(nn.Module):
@@ -348,44 +320,57 @@ class DreamZeroWanTextEncoder(nn.Module):
         *,
         params_dtype: torch.dtype | None = torch.float32,
         device: torch.device | str | None = None,
+        mesh: Mesh | str = "model",
     ) -> None:
         super().__init__()
         self.config = config or DreamZeroTextEncoderConfig()
-        self.token_embedding = nn.Embedding(
+        params_dtype = params_dtype or get_engine_config().device.params_dtype
+        # Small relative-bias tables are replicated; attention slices local heads.
+        position_mesh = Mesh(
+            build_rank_layout(ParallelConfig()), name="dreamzero_position_bias"
+        )
+        self.token_embedding = VocabParallelEmbedding(
             self.config.vocab,
             self.config.dim,
-            dtype=params_dtype,
+            padding_multiple=1,
+            params_dtype=params_dtype,
             device=device,
+            mesh=mesh,
+            prefix="token_embedding",
         )
         self.pos_embedding = (
             T5RelativeEmbedding(
                 self.config.num_buckets,
                 self.config.num_heads,
-                bidirectional=True,
                 params_dtype=params_dtype,
                 device=device,
+                mesh=position_mesh,
+                prefix="pos_embedding",
             )
             if self.config.shared_pos
             else None
         )
-        self.dropout = nn.Dropout(self.config.dropout)
         self.blocks = nn.ModuleList(
             [
                 T5SelfAttention(
                     self.config,
                     params_dtype=params_dtype,
                     device=device,
+                    mesh=mesh,
+                    position_mesh=position_mesh,
+                    prefix=f"blocks.{index}",
                 )
-                for _ in range(self.config.num_layers)
+                for index in range(self.config.num_layers)
             ]
         )
-        self.norm = T5LayerNorm(
+        self.norm = RMSNorm(
             self.config.dim,
-            params_dtype=params_dtype,
+            eps=1e-6,
+            dtype=params_dtype,
             device=device,
+            cast_before_affine=True,
+            prefix="norm",
         )
-        self.apply(init_weights)
-        attach_replicated_text_encoder_weights(self)
 
     def forward(
         self,
@@ -396,7 +381,7 @@ class DreamZeroWanTextEncoder(nn.Module):
             raise ValueError(
                 f"input_ids must be 2-D (B, L); got shape {tuple(input_ids.shape)}."
             )
-        x = self.dropout(self.token_embedding(input_ids))
+        x = self.token_embedding(input_ids)
         pos_bias = (
             self.pos_embedding(x.size(1), x.size(1))
             if self.pos_embedding is not None
@@ -404,15 +389,13 @@ class DreamZeroWanTextEncoder(nn.Module):
         )
         for block in self.blocks:
             x = block(x, mask=attention_mask, pos_bias=pos_bias)
-        x = self.norm(x)
-        return self.dropout(x)
+        return self.norm(x)
 
 
 __all__ = [
     "DreamZeroWanTextEncoder",
     "T5Attention",
     "T5FeedForward",
-    "T5LayerNorm",
     "T5RelativeEmbedding",
     "T5SelfAttention",
     "dreamzero_text_encoder_weight_remap",

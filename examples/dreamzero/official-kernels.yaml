@@ -1,9 +1,0 @@
-schema: phyai.kernel/v1
-profile: static
-overrides:
-  - id: dreamzero-official-layernorm
-    match: {op: layernorm}
-    use: torch.layernorm
-  - id: dreamzero-official-vae-norm
-    match: {op: channel_l2_norm}
-    use: torch.channel_l2_norm

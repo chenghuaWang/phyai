@@ -7,15 +7,17 @@ consume optional cache tensors and return updated tensors.
 
 from __future__ import annotations
 
-import importlib
 import math
-from collections.abc import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.layers import LayerNorm
+import phyai.parallel as P
+from phyai.engine_config import get_engine_config
+from phyai.layers import LayerNorm, SiLU
+from phyai.layers.conv import Conv3d
+from phyai.layers.mlp import DenseMLP
 from phyai.layers.attention.nocache.layer import Attention
 from phyai.layers.linear import (
     ColumnParallelLinear,
@@ -27,75 +29,6 @@ from phyai.weights.shards import replicated, sharded
 
 
 _DREAMZERO_DIT_PREFIX = "action_head.model."
-_DREAMZERO_DROPPED_PREFIXES = (
-    "action_head.text_encoder.",
-    "action_head.image_encoder.",
-    "action_head.vae.",
-)
-
-
-def _get_flash_attn_varlen_func() -> Callable[..., torch.Tensor]:
-    try:
-        flash_attn = importlib.import_module("flash_attn")
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "DreamZero TE cross-attention requires FlashAttention 2."
-        ) from exc
-    return flash_attn.flash_attn_varlen_func
-
-
-def _dreamzero_fa2_cross_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-) -> torch.Tensor:
-    """Match the official DreamZero FlashAttention 2 cross-attention call."""
-    batch_size, query_length = query.shape[:2]
-    key_length = key.shape[1]
-    query_flat = query.flatten(0, 1).to(value.dtype)
-    key_flat = key.flatten(0, 1).to(value.dtype)
-    value_flat = value.flatten(0, 1)
-    query_lengths = torch.full(
-        (batch_size,), query_length, dtype=torch.int32, device=query.device
-    )
-    key_lengths = torch.full(
-        (batch_size,), key_length, dtype=torch.int32, device=key.device
-    )
-    cu_seqlens_q = torch.cat([query_lengths.new_zeros(1), query_lengths]).cumsum(
-        0, dtype=torch.int32
-    )
-    cu_seqlens_k = torch.cat([key_lengths.new_zeros(1), key_lengths]).cumsum(
-        0, dtype=torch.int32
-    )
-    output = _get_flash_attn_varlen_func()(
-        q=query_flat,
-        k=key_flat,
-        v=value_flat,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=query_length,
-        max_seqlen_k=key_length,
-        dropout_p=0.0,
-        softmax_scale=None,
-        causal=False,
-        window_size=(-1, -1),
-        deterministic=False,
-    )
-    return output.unflatten(0, (batch_size, query_length)).type(query.dtype)
-
-
-def _attach_replicated(param: nn.Parameter, key: str) -> None:
-    param.hf_keys = [(key, None)]
-    param.weight_loader = replicated()
-
-
-def _attach_tp_sharded(param: nn.Parameter, key: str, dim: int = 0) -> None:
-    param.hf_keys = [(key, None)]
-    mesh = _current_mesh_or_none()
-    if mesh is None:
-        param.weight_loader = replicated()
-    else:
-        param.weight_loader = sharded(dim=dim, group="dense_tp", mesh=mesh)
 
 
 def _validate_kv_cache(
@@ -125,13 +58,6 @@ def _swish(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(x)
 
 
-def _linear(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    out = module(x)
-    if isinstance(out, tuple):
-        return out[0]
-    return out
-
-
 class DreamZeroTensorParallelRMSNorm(nn.Module):
     """RMSNorm over the full hidden dimension with TP-sharded activations.
 
@@ -159,13 +85,16 @@ class DreamZeroTensorParallelRMSNorm(nn.Module):
         self.hidden_size = hidden_size
         self.local_size = local_size
         self.eps = eps
+        self.mesh = P.default_mesh()
+        self.tp_size = self.mesh.group_size("dense_tp")
         dtype = params_dtype or torch.get_default_dtype()
         self.weight = nn.Parameter(
             torch.ones(local_size, dtype=dtype, device=device),
             requires_grad=False,
         )
         if prefix:
-            _attach_tp_sharded(self.weight, f"{prefix}.weight")
+            self.weight.hf_keys = [(f"{prefix}.weight", None)]
+            self.weight.weight_loader = sharded(dim=0, group="dense_tp", mesh=self.mesh)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-1] != self.local_size:
@@ -173,10 +102,8 @@ class DreamZeroTensorParallelRMSNorm(nn.Module):
                 f"Expected local shard dim={self.local_size}, got {x.shape[-1]}."
             )
         local_sum = x.float().pow(2).sum(dim=-1, keepdim=True)
-        if _current_tp_size() > 1:
-            import phyai.parallel as P
-
-            local_sum = P.all_reduce(local_sum, group="dense_tp")
+        if self.tp_size > 1:
+            local_sum = P.all_reduce(local_sum, group="dense_tp", mesh=self.mesh)
         inv_rms = torch.rsqrt(local_sum / self.hidden_size + self.eps)
         return (x.float() * inv_rms).to(dtype=x.dtype) * self.weight
 
@@ -216,39 +143,6 @@ def dreamzero_rope_params(
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-def _dreamzero_rope_action_apply(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    freqs_action: torch.Tensor,
-    freqs_state: torch.Tensor,
-    action_register_length: int | None,
-    *,
-    num_action_per_block: int,
-    num_state_per_block: int,
-) -> torch.Tensor:
-    batch_size, seq_len, num_heads, _ = x.shape
-    x_complex = torch.view_as_complex(
-        x.to(torch.float64).reshape(batch_size, seq_len, num_heads, -1, 2)
-    )
-    freqs = freqs.to(device=x.device)
-    if action_register_length is not None:
-        chunk_size = action_register_length // (
-            num_action_per_block + num_state_per_block
-        )
-        action_freqs = freqs_action[: chunk_size * num_action_per_block].to(
-            device=x.device
-        )
-        state_freqs = freqs_state[: chunk_size * num_state_per_block].to(
-            device=x.device
-        )
-        action_state_freqs = torch.cat([action_freqs, state_freqs], dim=0).view(
-            action_register_length, 1, -1
-        )
-        freqs = torch.cat([freqs, action_state_freqs], dim=0)
-    rotated = torch.view_as_real(x_complex * freqs.unsqueeze(0)).flatten(3)
-    return rotated.to(dtype=x.dtype)
-
-
 def _dreamzero_causal_rope_action_apply(
     x: torch.Tensor,
     freqs: torch.Tensor,
@@ -264,7 +158,6 @@ def _dreamzero_causal_rope_action_apply(
     x_complex = torch.view_as_complex(
         x.to(torch.float64).reshape(batch_size, seq_len, num_heads, -1, 2)
     )
-    freqs = freqs.to(device=x.device)
     if action_register_length is not None:
         if action_register_length != num_action_per_block + num_state_per_block:
             raise ValueError(
@@ -273,12 +166,8 @@ def _dreamzero_causal_rope_action_apply(
             )
         action_start = action_state_index * num_action_per_block
         state_start = action_state_index * num_state_per_block
-        action_freqs = freqs_action[
-            action_start : action_start + num_action_per_block
-        ].to(device=x.device)
-        state_freqs = freqs_state[state_start : state_start + num_state_per_block].to(
-            device=x.device
-        )
+        action_freqs = freqs_action[action_start : action_start + num_action_per_block]
+        state_freqs = freqs_state[state_start : state_start + num_state_per_block]
         action_state_freqs = torch.cat([action_freqs, state_freqs], dim=0).view(
             action_register_length, 1, -1
         )
@@ -315,12 +204,10 @@ class DreamZeroSinusoidalPositionalEncoding(nn.Module):
 
 
 class DreamZeroCategorySpecificLinear(nn.Module):
-    """Category-specific linear weight container.
+    """Category-specific linear projection with checkpoint-native weight layout.
 
     The reference DreamZero action/state encoder stores weights as
     ``[num_categories, in_dim, out_dim]`` and applies them with ``torch.bmm``.
-    This phase only declares parameters and loaders; the forward path is added
-    with the runner/KV-cache implementation.
     """
 
     def __init__(
@@ -336,8 +223,6 @@ class DreamZeroCategorySpecificLinear(nn.Module):
         super().__init__()
         dtype = params_dtype or torch.get_default_dtype()
         self.num_categories = num_categories
-        self.input_dim = input_dim
-        self.output_dim = output_dim
         self.W = nn.Parameter(
             torch.empty(
                 num_categories, input_dim, output_dim, dtype=dtype, device=device
@@ -349,8 +234,10 @@ class DreamZeroCategorySpecificLinear(nn.Module):
             requires_grad=False,
         )
         if prefix:
-            _attach_replicated(self.W, f"{prefix}.W")
-            _attach_replicated(self.b, f"{prefix}.b")
+            self.W.hf_keys = [(f"{prefix}.W", None)]
+            self.W.weight_loader = replicated()
+            self.b.hf_keys = [(f"{prefix}.b", None)]
+            self.b.weight_loader = replicated()
 
     def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
         if x.dim() != 3:
@@ -361,14 +248,11 @@ class DreamZeroCategorySpecificLinear(nn.Module):
                 f"{tuple(cat_ids.shape)} for batch={x.shape[0]}."
             )
         if self.num_categories == 1:
-            cat_ids = torch.zeros_like(cat_ids)
-        elif bool(((cat_ids < 0) | (cat_ids >= self.num_categories)).any().item()):
-            raise ValueError(
-                "cat_ids must be in range "
-                f"[0, {self.num_categories}), got {cat_ids.detach().cpu().tolist()}."
-            )
-        selected_W = self.W[cat_ids]
-        selected_b = self.b[cat_ids]
+            selected_W = self.W.expand(x.shape[0], -1, -1)
+            selected_b = self.b.expand(x.shape[0], -1)
+        else:
+            selected_W = self.W.index_select(0, cat_ids)
+            selected_b = self.b.index_select(0, cat_ids)
         return torch.bmm(x, selected_W) + selected_b.unsqueeze(1)
 
 
@@ -410,7 +294,7 @@ class DreamZeroCategorySpecificMLP(nn.Module):
 
 
 class DreamZeroActionEncoder(nn.Module):
-    """Multi-embodiment action encoder parameter skeleton."""
+    """Encode actions and timesteps for the selected embodiment."""
 
     def __init__(
         self,
@@ -494,7 +378,6 @@ class DreamZeroSelfAttention(nn.Module):
         params_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         attn_backend: str | None = None,
-        norm_backend: str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -576,646 +459,95 @@ class DreamZeroSelfAttention(nn.Module):
             head_dim=head_dim,
             num_kv_heads=self.num_local_heads,
             causal=False,
-            backend="sdpa" if attn_backend == "official" else attn_backend,
-            backend_kwargs={"select_kernel": True}
-            if attn_backend == "official"
-            else None,
+            backend=attn_backend,
+            kernel_role="dreamzero.self_attention",
         )
-        self.causal_attn = Attention(
-            num_heads=self.num_local_heads,
-            head_dim=head_dim,
-            num_kv_heads=self.num_local_heads,
-            causal=True,
-            backend="sdpa" if attn_backend == "official" else attn_backend,
-            backend_kwargs={"select_kernel": True}
-            if attn_backend == "official"
-            else None,
-        )
-
-    def _project_qkv(
-        self,
-        x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, seq_len, _ = x.shape
-        q, _ = self.q(x)
-        k, _ = self.k(x)
-        v, _ = self.v(x)
-        q = self.norm_q(q)
-        k = self.norm_k(k)
-        q = q.reshape(batch_size, seq_len, self.num_local_heads, self.head_dim)
-        k = k.reshape(batch_size, seq_len, self.num_local_heads, self.head_dim)
-        v = v.reshape(batch_size, seq_len, self.num_local_heads, self.head_dim)
-        return q, k, v
-
-    def _simple_forward(
-        self,
-        x: torch.Tensor,
-        *,
-        kv_cache: torch.Tensor | None = None,
-        use_cache: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        batch_size, seq_len, _ = x.shape
-        q, k, v = self._project_qkv(x)
-
-        k_all = k
-        v_all = v
-        if kv_cache is not None:
-            _validate_kv_cache(
-                kv_cache, batch_size, self.num_local_heads, self.head_dim
-            )
-            k_all = torch.cat([kv_cache[0], k], dim=1)
-            v_all = torch.cat([kv_cache[1], v], dim=1)
-
-        out = self.attn(q, k_all, v_all)
-        out = out.reshape(batch_size, seq_len, -1)
-        out, _ = self.o(out)
-
-        updated_kv_cache = None
-        if use_cache or kv_cache is not None:
-            updated_kv_cache = torch.stack([k_all, v_all], dim=0)
-        return out, updated_kv_cache
-
-    def _blockwise_causal_attn(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        action_horizon: int | None,
-        state_horizon: int | None,
-    ) -> torch.Tensor:
-        total_len = q.shape[1]
-        has_action_state = action_horizon is not None and state_horizon is not None
-        if not has_action_state:
-            num_frames = total_len // self.frame_seqlen
-            block_size = self.frame_seqlen * self.num_frame_per_block
-            num_blocks = (num_frames - 1) // self.num_frame_per_block
-            if num_blocks <= 0:
-                return self.attn(q, k, v)
-            if self.local_attn_size == -1:
-                return self.causal_attn(q, k, v)
-
-            output = torch.empty_like(q)
-            output[:, : self.frame_seqlen] = self.attn(
-                q[:, : self.frame_seqlen],
-                k[:, : self.frame_seqlen],
-                v[:, : self.frame_seqlen],
-            )
-            for block_idx in range(num_blocks):
-                block_start = self.frame_seqlen + block_idx * block_size
-                block_end = min(block_start + block_size, total_len)
-                kv_start = max(0, block_end - self.local_attn_size * self.frame_seqlen)
-                output[:, block_start:block_end] = self.attn(
-                    q[:, block_start:block_end],
-                    k[:, kv_start:block_end],
-                    v[:, kv_start:block_end],
-                )
-            return output
-
-        if action_horizon is None or state_horizon is None:
-            raise ValueError(
-                "action_horizon and state_horizon must be provided together."
-            )
-        first_image_len = self.frame_seqlen
-        image_blocks_len = total_len - first_image_len - action_horizon - state_horizon
-        image_block_size = self.num_frame_per_block * self.frame_seqlen
-        num_image_blocks = image_blocks_len // image_block_size
-        num_action_blocks = action_horizon // self.num_action_per_block
-        num_state_blocks = state_horizon // self.num_state_per_block
-        if (
-            num_image_blocks != num_action_blocks
-            or num_image_blocks != num_state_blocks
-        ):
-            raise ValueError(
-                "DreamZero block layout mismatch: "
-                f"image_blocks={num_image_blocks}, action_blocks={num_action_blocks}, "
-                f"state_blocks={num_state_blocks}."
-            )
-
-        image_start = first_image_len
-        image_end = image_start + image_blocks_len
-        action_start = image_end
-        state_start = action_start + action_horizon
-
-        output = torch.empty_like(q)
-        output[:, :first_image_len] = self.attn(
-            q[:, :first_image_len], k[:, :first_image_len], v[:, :first_image_len]
-        )
-
-        for block_idx in range(num_image_blocks):
-            block_start = image_start + block_idx * image_block_size
-            block_end = image_start + (block_idx + 1) * image_block_size
-            image_kv_start = (
-                max(image_start, block_end - self.local_attn_size * self.frame_seqlen)
-                if self.local_attn_size != -1
-                else image_start
-            )
-            action_block_start = action_start + block_idx * self.num_action_per_block
-            action_block_end = action_block_start + self.num_action_per_block
-            state_block_start = state_start + block_idx * self.num_state_per_block
-            state_block_end = state_block_start + self.num_state_per_block
-            k_context = torch.cat(
-                [
-                    k[:, :first_image_len],
-                    k[:, image_kv_start:block_end],
-                    k[:, action_block_start:action_block_end],
-                    k[:, state_block_start:state_block_end],
-                ],
-                dim=1,
-            )
-            v_context = torch.cat(
-                [
-                    v[:, :first_image_len],
-                    v[:, image_kv_start:block_end],
-                    v[:, action_block_start:action_block_end],
-                    v[:, state_block_start:state_block_end],
-                ],
-                dim=1,
-            )
-            output[:, block_start:block_end] = self.attn(
-                q[:, block_start:block_end], k_context, v_context
-            )
-
-        for block_idx in range(num_action_blocks):
-            action_block_start = action_start + block_idx * self.num_action_per_block
-            action_block_end = action_block_start + self.num_action_per_block
-            image_block_end = image_start + (block_idx + 1) * image_block_size
-            image_kv_start = (
-                max(
-                    image_start,
-                    image_block_end - self.local_attn_size * self.frame_seqlen,
-                )
-                if self.local_attn_size != -1
-                else image_start
-            )
-            state_block_start = state_start + block_idx * self.num_state_per_block
-            state_block_end = state_block_start + self.num_state_per_block
-            k_context = torch.cat(
-                [
-                    k[:, :first_image_len],
-                    k[:, image_kv_start:image_block_end],
-                    k[:, action_block_start:action_block_end],
-                    k[:, state_block_start:state_block_end],
-                ],
-                dim=1,
-            )
-            v_context = torch.cat(
-                [
-                    v[:, :first_image_len],
-                    v[:, image_kv_start:image_block_end],
-                    v[:, action_block_start:action_block_end],
-                    v[:, state_block_start:state_block_end],
-                ],
-                dim=1,
-            )
-            output[:, action_block_start:action_block_end] = self.attn(
-                q[:, action_block_start:action_block_end], k_context, v_context
-            )
-
-        for block_idx in range(num_state_blocks):
-            state_block_start = state_start + block_idx * self.num_state_per_block
-            state_block_end = state_block_start + self.num_state_per_block
-            output[:, state_block_start:state_block_end] = self.attn(
-                q[:, state_block_start:state_block_end],
-                k[:, state_block_start:state_block_end],
-                v[:, state_block_start:state_block_end],
-            )
-        return output
-
-    def _process_clean_image_only(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        clean_frames: int,
-    ) -> torch.Tensor:
-        block_size = self.frame_seqlen * self.num_frame_per_block
-        num_blocks = (clean_frames - 1) // self.num_frame_per_block
-        if num_blocks == 0:
-            return self.attn(
-                q[:, : self.frame_seqlen],
-                k[:, : self.frame_seqlen],
-                v[:, : self.frame_seqlen],
-            )
-        output = torch.empty_like(q)
-        output[:, : self.frame_seqlen] = self.attn(
-            q[:, : self.frame_seqlen],
-            k[:, : self.frame_seqlen],
-            v[:, : self.frame_seqlen],
-        )
-        if self.local_attn_size == -1:
-            output[:, self.frame_seqlen :] = self.causal_attn(
-                q[:, self.frame_seqlen :], k, v
-            )
-            return output
-        for block_idx in range(num_blocks):
-            block_start = self.frame_seqlen + block_idx * block_size
-            block_end = min(block_start + block_size, q.shape[1])
-            image_kv_start = max(
-                self.frame_seqlen,
-                block_end - self.local_attn_size * self.frame_seqlen,
-            )
-            output[:, block_start:block_end] = self.attn(
-                q[:, block_start:block_end],
-                torch.cat(
-                    [k[:, : self.frame_seqlen], k[:, image_kv_start:block_end]], dim=1
-                ),
-                torch.cat(
-                    [v[:, : self.frame_seqlen], v[:, image_kv_start:block_end]], dim=1
-                ),
-            )
-        return output
-
-    def _process_state_blocks(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        state_horizon: int,
-    ) -> torch.Tensor:
-        num_blocks = state_horizon // self.num_state_per_block
-        if num_blocks == 1:
-            return self.attn(q, k, v)
-        output = torch.empty_like(q)
-        for block_idx in range(num_blocks):
-            start = block_idx * self.num_state_per_block
-            end = start + self.num_state_per_block
-            output[:, start:end] = self.attn(
-                q[:, start:end], k[:, start:end], v[:, start:end]
-            )
-        return output
-
-    def _process_noisy_image_blocks(
-        self,
-        noisy_image_q: torch.Tensor,
-        noisy_image_k: torch.Tensor,
-        noisy_image_v: torch.Tensor,
-        clean_image_k: torch.Tensor,
-        clean_image_v: torch.Tensor,
-        noisy_action_k: torch.Tensor,
-        noisy_action_v: torch.Tensor,
-        noisy_state_k: torch.Tensor,
-        noisy_state_v: torch.Tensor,
-        half_frames: int,
-    ) -> torch.Tensor:
-        block_size = self.frame_seqlen * self.num_frame_per_block
-        num_blocks = (half_frames - 1) // self.num_frame_per_block
-        output = torch.empty_like(noisy_image_q)
-        output[:, : self.frame_seqlen] = self.attn(
-            noisy_image_q[:, : self.frame_seqlen],
-            noisy_image_k[:, : self.frame_seqlen],
-            noisy_image_v[:, : self.frame_seqlen],
-        )
-        for block_idx in range(num_blocks):
-            noisy_start = self.frame_seqlen + block_idx * block_size
-            noisy_end = noisy_start + block_size
-            clean_end = self.frame_seqlen + block_idx * block_size
-            action_start = block_idx * self.num_action_per_block
-            action_end = action_start + self.num_action_per_block
-            state_start = block_idx * self.num_state_per_block
-            state_end = state_start + self.num_state_per_block
-            output[:, noisy_start:noisy_end] = self.attn(
-                noisy_image_q[:, noisy_start:noisy_end],
-                torch.cat(
-                    [
-                        clean_image_k[:, :clean_end],
-                        noisy_image_k[:, noisy_start:noisy_end],
-                        noisy_action_k[:, action_start:action_end],
-                        noisy_state_k[:, state_start:state_end],
-                    ],
-                    dim=1,
-                ),
-                torch.cat(
-                    [
-                        clean_image_v[:, :clean_end],
-                        noisy_image_v[:, noisy_start:noisy_end],
-                        noisy_action_v[:, action_start:action_end],
-                        noisy_state_v[:, state_start:state_end],
-                    ],
-                    dim=1,
-                ),
-            )
-        return output
-
-    def _process_noisy_action_blocks(
-        self,
-        noisy_action_q: torch.Tensor,
-        noisy_action_k: torch.Tensor,
-        noisy_action_v: torch.Tensor,
-        clean_image_k: torch.Tensor,
-        clean_image_v: torch.Tensor,
-        noisy_image_k: torch.Tensor,
-        noisy_image_v: torch.Tensor,
-        noisy_state_k: torch.Tensor,
-        noisy_state_v: torch.Tensor,
-        half_frames: int,
-    ) -> torch.Tensor:
-        num_blocks = (half_frames - 1) // self.num_frame_per_block
-        output = torch.empty_like(noisy_action_q)
-        for block_idx in range(num_blocks):
-            action_start = block_idx * self.num_action_per_block
-            action_end = action_start + self.num_action_per_block
-            clean_end = (
-                self.frame_seqlen
-                + block_idx * self.frame_seqlen * self.num_frame_per_block
-            )
-            noisy_start = (
-                self.frame_seqlen
-                + block_idx * self.frame_seqlen * self.num_frame_per_block
-            )
-            noisy_end = noisy_start + self.frame_seqlen * self.num_frame_per_block
-            state_start = block_idx * self.num_state_per_block
-            state_end = state_start + self.num_state_per_block
-            output[:, action_start:action_end] = self.attn(
-                noisy_action_q[:, action_start:action_end],
-                torch.cat(
-                    [
-                        clean_image_k[:, :clean_end],
-                        noisy_image_k[:, noisy_start:noisy_end],
-                        noisy_action_k[:, action_start:action_end],
-                        noisy_state_k[:, state_start:state_end],
-                    ],
-                    dim=1,
-                ),
-                torch.cat(
-                    [
-                        clean_image_v[:, :clean_end],
-                        noisy_image_v[:, noisy_start:noisy_end],
-                        noisy_action_v[:, action_start:action_end],
-                        noisy_state_v[:, state_start:state_end],
-                    ],
-                    dim=1,
-                ),
-            )
-        return output
 
     def forward(
         self,
         x: torch.Tensor,
-        freqs: torch.Tensor | None = None,
-        freqs_action: torch.Tensor | None = None,
-        freqs_state: torch.Tensor | None = None,
+        freqs: torch.Tensor,
+        freqs_action: torch.Tensor,
+        freqs_state: torch.Tensor,
         action_register_length: int | None = None,
         *,
         kv_cache: torch.Tensor | None = None,
-        use_cache: bool = False,
         current_start_frame: int = 0,
-        is_tf: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if freqs is None:
-            return self._simple_forward(x, kv_cache=kv_cache, use_cache=use_cache)
-        if freqs_action is None or freqs_state is None:
-            raise ValueError("freqs_action and freqs_state are required with freqs.")
-
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
-        q, k, v = self._project_qkv(x)
-        updated_kv_cache: torch.Tensor | None = None
-
-        if kv_cache is None:
-            if is_tf:
-                register_len = action_register_length or 0
-                half_seq_len = (seq_len - register_len) // 2
-                q_context = q[:, :half_seq_len]
-                k_context = k[:, :half_seq_len]
-                q_noisy = q[:, half_seq_len:]
-                k_noisy = k[:, half_seq_len:]
-                rq_context = _dreamzero_rope_action_apply(
-                    q_context,
-                    freqs,
-                    freqs_action,
-                    freqs_state,
-                    None,
-                    num_action_per_block=self.num_action_per_block,
-                    num_state_per_block=self.num_state_per_block,
-                )
-                rk_context = _dreamzero_rope_action_apply(
-                    k_context,
-                    freqs,
-                    freqs_action,
-                    freqs_state,
-                    None,
-                    num_action_per_block=self.num_action_per_block,
-                    num_state_per_block=self.num_state_per_block,
-                )
-                rq_noisy = _dreamzero_rope_action_apply(
-                    q_noisy,
-                    freqs,
-                    freqs_action,
-                    freqs_state,
-                    action_register_length,
-                    num_action_per_block=self.num_action_per_block,
-                    num_state_per_block=self.num_state_per_block,
-                )
-                rk_noisy = _dreamzero_rope_action_apply(
-                    k_noisy,
-                    freqs,
-                    freqs_action,
-                    freqs_state,
-                    action_register_length,
-                    num_action_per_block=self.num_action_per_block,
-                    num_state_per_block=self.num_state_per_block,
-                )
-                roped_query = torch.cat([rq_context, rq_noisy], dim=1)
-                roped_key = torch.cat([rk_context, rk_noisy], dim=1)
-
-                if action_register_length is not None:
-                    clean_image_seq_len = half_seq_len
-                    noisy_image_seq_len = half_seq_len
-                    noisy_frames = noisy_image_seq_len // self.frame_seqlen
-                    num_image_blocks = (noisy_frames - 1) // self.num_frame_per_block
-                    action_horizon = num_image_blocks * self.num_action_per_block
-                    state_horizon = num_image_blocks * self.num_state_per_block
-                    expected = (
-                        half_seq_len
-                        + noisy_image_seq_len
-                        + action_horizon
-                        + state_horizon
-                    )
-                    if roped_query.shape[1] != expected:
-                        raise ValueError(
-                            "Sequence length does not match DreamZero "
-                            f"teacher-forcing block layout: got={roped_query.shape[1]}, "
-                            f"expected={expected}."
-                        )
-
-                    clean_image_q = roped_query[:, :clean_image_seq_len]
-                    clean_image_k = roped_key[:, :clean_image_seq_len]
-                    clean_image_v = v[:, :clean_image_seq_len]
-                    noisy_base = half_seq_len
-                    action_base = noisy_base + noisy_image_seq_len
-                    state_base = action_base + action_horizon
-                    noisy_image_q = roped_query[:, noisy_base:action_base]
-                    noisy_image_k = roped_key[:, noisy_base:action_base]
-                    noisy_image_v = v[:, noisy_base:action_base]
-                    noisy_action_q = roped_query[:, action_base:state_base]
-                    noisy_action_k = roped_key[:, action_base:state_base]
-                    noisy_action_v = v[:, action_base:state_base]
-                    noisy_state_q = roped_query[:, state_base:]
-                    noisy_state_k = roped_key[:, state_base:]
-                    noisy_state_v = v[:, state_base:]
-
-                    x_heads = torch.cat(
-                        [
-                            self._process_clean_image_only(
-                                clean_image_q,
-                                clean_image_k,
-                                clean_image_v,
-                                clean_image_seq_len // self.frame_seqlen,
-                            ),
-                            self._process_noisy_image_blocks(
-                                noisy_image_q,
-                                noisy_image_k,
-                                noisy_image_v,
-                                clean_image_k,
-                                clean_image_v,
-                                noisy_action_k,
-                                noisy_action_v,
-                                noisy_state_k,
-                                noisy_state_v,
-                                noisy_frames,
-                            ),
-                            self._process_noisy_action_blocks(
-                                noisy_action_q,
-                                noisy_action_k,
-                                noisy_action_v,
-                                clean_image_k,
-                                clean_image_v,
-                                noisy_image_k,
-                                noisy_image_v,
-                                noisy_state_k,
-                                noisy_state_v,
-                                noisy_frames,
-                            ),
-                            self._process_state_blocks(
-                                noisy_state_q,
-                                noisy_state_k,
-                                noisy_state_v,
-                                state_horizon,
-                            ),
-                        ],
-                        dim=1,
-                    )
-                else:
-                    clean_q = roped_query[:, :half_seq_len]
-                    clean_k = roped_key[:, :half_seq_len]
-                    clean_v = v[:, :half_seq_len]
-                    noisy_q = roped_query[:, half_seq_len:]
-                    noisy_k = roped_key[:, half_seq_len:]
-                    noisy_v = v[:, half_seq_len:]
-                    x_heads = torch.cat(
-                        [
-                            self._blockwise_causal_attn(
-                                clean_q,
-                                clean_k,
-                                clean_v,
-                                action_horizon=None,
-                                state_horizon=None,
-                            ),
-                            self.attn(
-                                noisy_q,
-                                torch.cat([clean_k, noisy_k], dim=1),
-                                torch.cat([clean_v, noisy_v], dim=1),
-                            ),
-                        ],
-                        dim=1,
-                    )
-            else:
-                roped_query = _dreamzero_rope_action_apply(
-                    q,
-                    freqs,
-                    freqs_action,
-                    freqs_state,
-                    action_register_length,
-                    num_action_per_block=self.num_action_per_block,
-                    num_state_per_block=self.num_state_per_block,
-                )
-                roped_key = _dreamzero_rope_action_apply(
-                    k,
-                    freqs,
-                    freqs_action,
-                    freqs_state,
-                    action_register_length,
-                    num_action_per_block=self.num_action_per_block,
-                    num_state_per_block=self.num_state_per_block,
-                )
-                if action_register_length is not None:
-                    chunk_size = action_register_length // (
-                        self.num_action_per_block + self.num_state_per_block
-                    )
-                    action_horizon = chunk_size * self.num_action_per_block
-                    state_horizon = chunk_size * self.num_state_per_block
-                else:
-                    action_horizon = None
-                    state_horizon = None
-                x_heads = self._blockwise_causal_attn(
-                    roped_query,
-                    roped_key,
-                    v,
-                    action_horizon=action_horizon,
-                    state_horizon=state_horizon,
-                )
-        else:
+        q, _ = self.q(x)
+        k, _ = self.k(x)
+        v, _ = self.v(x)
+        q = self.norm_q(q).reshape(
+            batch_size, seq_len, self.num_local_heads, self.head_dim
+        )
+        k = self.norm_k(k).reshape(
+            batch_size, seq_len, self.num_local_heads, self.head_dim
+        )
+        v = v.reshape(batch_size, seq_len, self.num_local_heads, self.head_dim)
+        if kv_cache is not None:
             _validate_kv_cache(
                 kv_cache, batch_size, self.num_local_heads, self.head_dim
             )
-            action_state_index = max(
-                0, (current_start_frame - 1) // self.num_frame_per_block
-            )
-            roped_query = _dreamzero_causal_rope_action_apply(
-                q,
-                freqs,
-                freqs_action,
-                freqs_state,
-                action_register_length,
-                num_action_per_block=self.num_action_per_block,
-                num_state_per_block=self.num_state_per_block,
-                action_state_index=action_state_index,
-            )
-            roped_key = _dreamzero_causal_rope_action_apply(
-                k,
-                freqs,
-                freqs_action,
-                freqs_state,
-                action_register_length,
-                num_action_per_block=self.num_action_per_block,
-                num_state_per_block=self.num_state_per_block,
-                action_state_index=action_state_index,
-            )
-            roped_action_query = None
-            roped_action_key = None
-            action_v = None
-            if action_register_length is not None:
-                roped_action_query = roped_query[:, -action_register_length:]
-                roped_query = roped_query[:, :-action_register_length]
-                roped_action_key = roped_key[:, -action_register_length:]
-                roped_key = roped_key[:, :-action_register_length]
-                action_v = v[:, -action_register_length:]
-                v = v[:, :-action_register_length]
+        action_state_index = max(
+            0, (current_start_frame - 1) // self.num_frame_per_block
+        )
+        roped_query = _dreamzero_causal_rope_action_apply(
+            q,
+            freqs,
+            freqs_action,
+            freqs_state,
+            action_register_length,
+            num_action_per_block=self.num_action_per_block,
+            num_state_per_block=self.num_state_per_block,
+            action_state_index=action_state_index,
+        )
+        roped_key = _dreamzero_causal_rope_action_apply(
+            k,
+            freqs,
+            freqs_action,
+            freqs_state,
+            action_register_length,
+            num_action_per_block=self.num_action_per_block,
+            num_state_per_block=self.num_state_per_block,
+            action_state_index=action_state_index,
+        )
+        roped_action_query = None
+        roped_action_key = None
+        action_v = None
+        if action_register_length is not None:
+            roped_action_query = roped_query[:, -action_register_length:]
+            roped_query = roped_query[:, :-action_register_length]
+            roped_action_key = roped_key[:, -action_register_length:]
+            roped_key = roped_key[:, :-action_register_length]
+            action_v = v[:, -action_register_length:]
+            v = v[:, :-action_register_length]
 
+        if kv_cache is None:
+            new_k, new_v = roped_key, v
+        else:
             new_k = torch.cat([kv_cache[0], roped_key], dim=1)
             new_v = torch.cat([kv_cache[1], v], dim=1)
-            new_k = new_k[:, -self.max_attention_size :]
-            new_v = new_v[:, -self.max_attention_size :]
-            if action_register_length is not None:
-                if (
-                    roped_action_query is None
-                    or roped_action_key is None
-                    or action_v is None
-                ):
-                    raise RuntimeError("Missing action/state tensors after split.")
-                attn_query = torch.cat([roped_query, roped_action_query], dim=1)
-                attn_key = torch.cat([new_k, roped_action_key], dim=1)
-                attn_value = torch.cat([new_v, action_v], dim=1)
-            else:
-                attn_query = roped_query
-                attn_key = new_k
-                attn_value = new_v
-            x_heads = self.attn(attn_query, attn_key, attn_value)
-            updated_kv_cache = torch.stack([new_k, new_v], dim=0)
+        new_k = new_k[:, -self.max_attention_size :]
+        new_v = new_v[:, -self.max_attention_size :]
+        if action_register_length is not None:
+            if (
+                roped_action_query is None
+                or roped_action_key is None
+                or action_v is None
+            ):
+                raise RuntimeError("Missing action/state tensors after split.")
+            attn_query = torch.cat([roped_query, roped_action_query], dim=1)
+            attn_key = torch.cat([new_k, roped_action_key], dim=1)
+            attn_value = torch.cat([new_v, action_v], dim=1)
+        else:
+            attn_query = roped_query
+            attn_key = new_k
+            attn_value = new_v
+        x_heads = self.attn(attn_query, attn_key, attn_value)
+        updated_kv_cache = torch.stack([new_k, new_v], dim=0)
         merged = x_heads.reshape(batch_size, x_heads.shape[1], -1)
         out, _ = self.o(merged)
-        if use_cache and updated_kv_cache is None:
-            updated_kv_cache = torch.stack([k, v], dim=0)
         return out, updated_kv_cache
 
 
@@ -1234,7 +566,6 @@ class DreamZeroCrossAttention(nn.Module):
         params_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         attn_backend: str | None = None,
-        norm_backend: str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -1291,13 +622,13 @@ class DreamZeroCrossAttention(nn.Module):
         self.num_heads = config.dit.num_heads
         self.num_local_heads = self.q.output_size_per_partition // head_dim
         self.head_dim = head_dim
-        self.use_fa2_cross_attention = attn_backend in ("te", "official")
         self.attn = Attention(
             num_heads=self.num_local_heads,
             head_dim=head_dim,
             num_kv_heads=self.num_local_heads,
             causal=False,
-            backend="sdpa" if attn_backend == "official" else attn_backend,
+            backend=attn_backend,
+            kernel_role="dreamzero.cross_attention",
         )
 
     def forward(
@@ -1348,14 +679,8 @@ class DreamZeroCrossAttention(nn.Module):
             batch_size, image_context_tokens, self.num_local_heads, self.head_dim
         )
 
-        if self.use_fa2_cross_attention:
-            text_out = _dreamzero_fa2_cross_attention(q, k, v)
-        else:
-            text_out = self.attn(q, k, v)
-        if self.use_fa2_cross_attention:
-            image_out = _dreamzero_fa2_cross_attention(q, k_img, v_img)
-        else:
-            image_out = self.attn(q, k_img, v_img)
+        text_out = self.attn(q, k, v)
+        image_out = self.attn(q, k_img, v_img)
         summed_heads = text_out + image_out
         merged = summed_heads.reshape(batch_size, seq_len, -1)
         out, _ = self.o(merged)
@@ -1364,47 +689,6 @@ class DreamZeroCrossAttention(nn.Module):
         if use_cache or crossattn_cache is not None:
             updated_crossattn_cache = torch.stack([k, v], dim=0)
         return out, updated_crossattn_cache
-
-
-class DreamZeroMLP(nn.Module):
-    """TP-sharded FFN skeleton matching ``ffn.0`` and ``ffn.2`` keys."""
-
-    def __init__(
-        self,
-        config: DreamZeroConfig,
-        *,
-        params_dtype: torch.dtype | None = None,
-        device: torch.device | str | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.fc1 = ColumnParallelLinear(
-            config.dit.dim,
-            config.dit.ffn_dim,
-            bias=True,
-            gather_output=False,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.0" if prefix else "",
-        )
-        self.fc2 = RowParallelLinear(
-            config.dit.ffn_dim,
-            config.dit.dim,
-            bias=True,
-            input_is_parallel=True,
-            params_dtype=params_dtype,
-            device=device,
-            prefix=f"{prefix}.2" if prefix else "",
-        )
-
-    def forward(self, *args, **kwargs):
-        if len(args) != 1 or kwargs:
-            raise TypeError("DreamZeroMLP.forward expects exactly one tensor argument.")
-        x = args[0]
-        x, _ = self.fc1(x)
-        x = F.gelu(x, approximate="tanh")
-        x, _ = self.fc2(x)
-        return x
 
 
 class DreamZeroDiTBlock(nn.Module):
@@ -1426,6 +710,7 @@ class DreamZeroDiTBlock(nn.Module):
             dim,
             eps=config.dit.eps,
             bias=False,
+            elementwise_affine=False,
             backend=norm_backend,
             dtype=params_dtype,
             device=device,
@@ -1435,7 +720,6 @@ class DreamZeroDiTBlock(nn.Module):
             params_dtype=params_dtype,
             device=device,
             attn_backend=attn_backend,
-            norm_backend=norm_backend,
             prefix=f"{prefix}.self_attn" if prefix else "",
         )
         self.norm3 = LayerNorm(
@@ -1452,19 +736,24 @@ class DreamZeroDiTBlock(nn.Module):
             params_dtype=params_dtype,
             device=device,
             attn_backend=attn_backend,
-            norm_backend=norm_backend,
             prefix=f"{prefix}.cross_attn" if prefix else "",
         )
         self.norm2 = LayerNorm(
             dim,
             eps=config.dit.eps,
             bias=False,
+            elementwise_affine=False,
             backend=norm_backend,
             dtype=params_dtype,
             device=device,
         )
-        self.ffn = DreamZeroMLP(
-            config,
+        self.ffn = DenseMLP(
+            dim,
+            config.dit.ffn_dim,
+            activation="gelu_tanh",
+            gated=False,
+            bias=True,
+            sequence_parallel=False,
             params_dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.ffn" if prefix else "",
@@ -1475,7 +764,8 @@ class DreamZeroDiTBlock(nn.Module):
             requires_grad=False,
         )
         if prefix:
-            _attach_replicated(self.modulation, f"{prefix}.modulation")
+            self.modulation.hf_keys = [(f"{prefix}.modulation", None)]
+            self.modulation.weight_loader = replicated()
 
     def forward(
         self,
@@ -1490,23 +780,10 @@ class DreamZeroDiTBlock(nn.Module):
         kv_cache: torch.Tensor | None = None,
         crossattn_cache: torch.Tensor | None = None,
         current_start_frame: int = 0,
-        is_tf: bool = True,
         image_context_tokens: int = 257,
         use_crossattn_cache: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        modulation = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
-        aligned = []
-        seq_len = x.shape[1]
-        for part in modulation:
-            part_len = part.shape[1]
-            if part_len == seq_len:
-                aligned.append(part)
-            elif part_len >= seq_len:
-                aligned.append(part[:, :seq_len])
-            else:
-                repeat = (seq_len + part_len - 1) // part_len
-                aligned.append(part.repeat_interleave(repeat, dim=1)[:, :seq_len])
-        e0, e1, e2, e3, e4, e5 = [part.squeeze(2) for part in aligned]
+        e0, e1, e2, e3, e4, e5 = (self.modulation.unsqueeze(1) + e).unbind(dim=2)
 
         self_attn_input = self.norm1(x) * (1 + e1) + e0
         y, updated_kv_cache = self.self_attn(
@@ -1517,7 +794,6 @@ class DreamZeroDiTBlock(nn.Module):
             action_register_length=action_register_length,
             kv_cache=kv_cache,
             current_start_frame=current_start_frame,
-            is_tf=is_tf,
         )
         x = x + y * e2
 
@@ -1537,7 +813,7 @@ class DreamZeroDiTBlock(nn.Module):
 
 
 class DreamZeroCausalHead(nn.Module):
-    """Output head skeleton matching ``head.head`` and ``head.modulation``."""
+    """Project video tokens to latent predictions."""
 
     def __init__(
         self,
@@ -1556,6 +832,7 @@ class DreamZeroCausalHead(nn.Module):
             dim,
             eps=config.dit.eps,
             bias=False,
+            elementwise_affine=False,
             backend=norm_backend,
             dtype=params_dtype,
             device=device,
@@ -1574,27 +851,18 @@ class DreamZeroCausalHead(nn.Module):
             requires_grad=False,
         )
         if prefix:
-            _attach_replicated(self.modulation, f"{prefix}.modulation")
+            self.modulation.hf_keys = [(f"{prefix}.modulation", None)]
+            self.modulation.weight_loader = replicated()
 
     def forward(self, x: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
-        modulation = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
-        aligned = []
-        seq_len = x.shape[1]
-        for part in modulation:
-            part_len = part.shape[1]
-            if part_len == seq_len:
-                aligned.append(part)
-            elif part_len >= seq_len:
-                aligned.append(part[:, :seq_len])
-            else:
-                repeat = (seq_len + part_len - 1) // part_len
-                aligned.append(part.repeat_interleave(repeat, dim=1)[:, :seq_len])
-        shift, scale = [part.squeeze(2) for part in aligned]
-        return _linear(self.head, self.norm(x) * (1 + scale) + shift)
+        shift, scale = (self.modulation.unsqueeze(1) + e).unbind(dim=2)
+        return self.head(self.norm(x) * (1 + scale) + shift)[0]
 
 
 class DreamZeroDiT(nn.Module):
     """DreamZero Causal Wan DiT with TP-sharded DiT blocks."""
+
+    patch_size = (1, 2, 2)
 
     def __init__(
         self,
@@ -1606,19 +874,19 @@ class DreamZeroDiT(nn.Module):
         norm_backend: str | None = None,
     ) -> None:
         super().__init__()
-        config.dit.validate_tp_size(_current_tp_size())
+        device = get_engine_config().device.target if device is None else device
+        params_dtype = params_dtype or get_engine_config().device.params_dtype
+        config.dit.validate_tp_size(P.default_mesh().group_size("dense_tp"))
         self.config = config
-        self.patch_embedding = nn.Conv3d(
+        self.patch_embedding = Conv3d(
             config.dit.in_dim,
             config.dit.dim,
             kernel_size=(1, 2, 2),
             stride=(1, 2, 2),
             device=device,
             dtype=params_dtype,
+            prefix="patch_embedding",
         )
-        _attach_replicated(self.patch_embedding.weight, "patch_embedding.weight")
-        if self.patch_embedding.bias is not None:
-            _attach_replicated(self.patch_embedding.bias, "patch_embedding.bias")
 
         self.text_embedding = nn.ModuleList(
             [
@@ -1640,6 +908,7 @@ class DreamZeroDiT(nn.Module):
                 ),
             ]
         )
+        self.time_activation = SiLU()
         self.time_embedding = nn.ModuleList(
             [
                 ReplicatedLinear(
@@ -1660,17 +929,13 @@ class DreamZeroDiT(nn.Module):
                 ),
             ]
         )
-        self.time_projection = nn.ModuleList(
-            [
-                ReplicatedLinear(
-                    config.dit.dim,
-                    config.dit.dim * 6,
-                    bias=True,
-                    params_dtype=params_dtype,
-                    device=device,
-                    prefix="time_projection.1",
-                )
-            ]
+        self.time_projection = ReplicatedLinear(
+            config.dit.dim,
+            config.dit.dim * 6,
+            bias=True,
+            params_dtype=params_dtype,
+            device=device,
+            prefix="time_projection.1",
         )
         self.img_emb = nn.ModuleDict(
             {
@@ -1766,14 +1031,10 @@ class DreamZeroDiT(nn.Module):
             dreamzero_rope_params(1024, 2 * (head_dim // 6), device=device),
         ]
 
-    @property
-    def patch_size(self) -> tuple[int, int, int]:
-        return (1, 2, 2)
-
     def _text_embedding(self, context: torch.Tensor) -> torch.Tensor:
-        context = _linear(self.text_embedding[0], context)
+        context = self.text_embedding[0](context)[0]
         context = F.gelu(context, approximate="tanh")
-        return _linear(self.text_embedding[1], context)
+        return self.text_embedding[1](context)[0]
 
     def _time_embedding(
         self, timestep: torch.Tensor, dtype: torch.dtype
@@ -1781,27 +1042,22 @@ class DreamZeroDiT(nn.Module):
         emb = dreamzero_sinusoidal_embedding_1d(
             self.config.dit.freq_dim, timestep.flatten()
         ).to(dtype=dtype, device=timestep.device)
-        emb = _linear(self.time_embedding[0], emb)
-        emb = F.silu(emb)
-        return _linear(self.time_embedding[1], emb)
-
-    def _time_projection(self, e: torch.Tensor) -> torch.Tensor:
-        e = F.silu(e)
-        return _linear(self.time_projection[0], e)
+        emb = self.time_embedding[0](emb)[0]
+        emb = self.time_activation(emb)
+        return self.time_embedding[1](emb)[0]
 
     def _img_embedding(self, clip_feature: torch.Tensor) -> torch.Tensor:
         x = self.img_emb["proj_0_norm"](clip_feature)
-        x = _linear(self.img_emb["proj_1"], x)
+        x = self.img_emb["proj_1"](x)[0]
         x = F.gelu(x)
-        x = _linear(self.img_emb["proj_3"], x)
+        x = self.img_emb["proj_3"](x)[0]
         return self.img_emb["proj_4_norm"](x)
 
-    def _create_freqs(self, grid_size: torch.Tensor, start_frame: int) -> torch.Tensor:
-        device = self.patch_embedding.weight.device
-        freqs = [freq.to(device) for freq in self.freqs]
-        self.freqs_action = self.freqs_action.to(device)
-        self.freqs_state = self.freqs_state.to(device)
-        f, h, w = grid_size.tolist()
+    def _create_freqs(
+        self, grid_size: tuple[int, int, int], start_frame: int
+    ) -> torch.Tensor:
+        freqs = self.freqs
+        f, h, w = grid_size
         return torch.cat(
             [
                 freqs[0][start_frame : start_frame + f]
@@ -1813,10 +1069,12 @@ class DreamZeroDiT(nn.Module):
             dim=-1,
         ).reshape(f * h * w, 1, -1)
 
-    def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor) -> torch.Tensor:
+    def unpatchify(
+        self, x: torch.Tensor, grid_size: tuple[int, int, int]
+    ) -> torch.Tensor:
         batch_size = x.shape[0]
         out_dim = self.config.dit.out_dim
-        grid = grid_size.tolist()
+        grid = grid_size
         if x.shape[1] != math.prod(grid):
             raise ValueError(
                 f"Expected {math.prod(grid)} patch tokens, got {x.shape[1]}."
@@ -1829,38 +1087,21 @@ class DreamZeroDiT(nn.Module):
             *[i * j for i, j in zip(grid, self.patch_size, strict=True)],
         )
 
-    def _prepare_video_tokens(
+    def forward(
         self,
         x: torch.Tensor,
-        y: torch.Tensor | None,
-        *,
-        concat_first_frame_latent: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if y is not None and concat_first_frame_latent:
-            x = torch.cat([x, y.to(dtype=x.dtype)], dim=1)
-        x = self.patch_embedding(x)
-        grid_size = torch.tensor(x.shape[2:], dtype=torch.long, device=x.device)
-        return x.flatten(start_dim=2).transpose(1, 2), grid_size
-
-    def _forward_blocks(
-        self,
-        x_tokens: torch.Tensor,
-        seq_len: int,
-        freqs: torch.Tensor,
         timestep: torch.Tensor,
         context: torch.Tensor,
-        clip_feature: torch.Tensor | None,
-        action: torch.Tensor | None,
-        timestep_action: torch.Tensor | None,
-        state: torch.Tensor | None,
-        embodiment_id: torch.Tensor | None,
-        kv_cache: list[torch.Tensor | None] | None,
-        crossattn_cache: list[torch.Tensor | None] | None,
-        current_start_frame: int,
         *,
-        clean_tokens: torch.Tensor | None = None,
-        aug_t: torch.Tensor | None = None,
-        is_tf: bool = False,
+        kv_cache: list[torch.Tensor | None] | None = None,
+        crossattn_cache: list[torch.Tensor | None] | None = None,
+        current_start_frame: int = 0,
+        y: torch.Tensor | None = None,
+        clip_feature: torch.Tensor | None = None,
+        action: torch.Tensor | None = None,
+        timestep_action: torch.Tensor | None = None,
+        state: torch.Tensor | None = None,
+        embodiment_id: torch.Tensor | None = None,
         image_context_tokens: int = 257,
         use_crossattn_cache: bool = False,
     ) -> tuple[
@@ -1869,7 +1110,15 @@ class DreamZeroDiT(nn.Module):
         list[torch.Tensor | None],
         list[torch.Tensor | None],
     ]:
+        if y is not None:
+            x = torch.cat([x, y.to(dtype=x.dtype)], dim=1)
+        x = self.patch_embedding(x)
+        grid_size = tuple(x.shape[2:])
+        x_tokens = x.flatten(start_dim=2).transpose(1, 2)
+        freqs = self._create_freqs(grid_size, current_start_frame)
+
         batch_size = x_tokens.shape[0]
+        seq_len = x_tokens.shape[1]
         timestep_frames = timestep.shape[1]
 
         if action is not None:
@@ -1916,7 +1165,6 @@ class DreamZeroDiT(nn.Module):
                 dtype=torch.long,
             )
             timestep_video = timestep[:, indices]
-        timestep_original = timestep_video
         if action is not None:
             if state_features is None or timestep_action is None:
                 raise RuntimeError("Missing state/action tensors.")
@@ -1928,18 +1176,10 @@ class DreamZeroDiT(nn.Module):
 
         e = self._time_embedding(timestep_video, x_tokens.dtype)
         e = e.unflatten(dim=0, sizes=(batch_size, -1))
-        e0 = self._time_projection(e).unflatten(dim=2, sizes=(6, self.config.dit.dim))
+        e0 = self.time_projection(self.time_activation(e))[0].unflatten(
+            dim=2, sizes=(6, self.config.dit.dim)
+        )
 
-        if clean_tokens is not None:
-            x_tokens = torch.cat([clean_tokens, x_tokens], dim=1)
-            if aug_t is None:
-                aug_t = torch.zeros_like(timestep_original)
-            e_clean = self._time_embedding(aug_t, x_tokens.dtype)
-            e_clean = e_clean.unflatten(dim=0, sizes=timestep_original.shape)
-            e0_clean = self._time_projection(e_clean).unflatten(
-                dim=2, sizes=(6, self.config.dit.dim)
-            )
-            e0 = torch.cat([e0_clean, e0], dim=1)
         context = self._text_embedding(context)
         if clip_feature is not None:
             clip_embedding = self._img_embedding(clip_feature)
@@ -1968,15 +1208,11 @@ class DreamZeroDiT(nn.Module):
                 kv_cache=kv_cache[block_index],
                 crossattn_cache=crossattn_cache[block_index],
                 current_start_frame=current_start_frame,
-                is_tf=is_tf,
                 image_context_tokens=image_context_tokens,
                 use_crossattn_cache=use_crossattn_cache,
             )
             updated_kv_caches.append(updated_kv_cache)
             updated_crossattn_caches.append(updated_crossattn_cache)
-
-        if clean_tokens is not None:
-            x_tokens = x_tokens[:, clean_tokens.shape[1] :]
 
         if action is not None:
             if embodiment_id is None:
@@ -1989,128 +1225,22 @@ class DreamZeroDiT(nn.Module):
         x_video = x_tokens[:, :seq_len]
         e_video = e[:, :seq_len]
         x_video = self.head(x_video, e_video.unsqueeze(2))
-        return x_video, action_noise_pred, updated_kv_caches, updated_crossattn_caches
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        timestep: torch.Tensor,
-        context: torch.Tensor,
-        *,
-        seq_len: int | None = None,
-        kv_cache: list[torch.Tensor | None] | None = None,
-        crossattn_cache: list[torch.Tensor | None] | None = None,
-        current_start_frame: int = 0,
-        y: torch.Tensor | None = None,
-        clip_feature: torch.Tensor | None = None,
-        action: torch.Tensor | None = None,
-        timestep_action: torch.Tensor | None = None,
-        state: torch.Tensor | None = None,
-        embodiment_id: torch.Tensor | None = None,
-        clean_x: torch.Tensor | None = None,
-        aug_t: torch.Tensor | None = None,
-        concat_first_frame_latent: bool = False,
-        image_context_tokens: int = 257,
-        use_crossattn_cache: bool = False,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor | None,
-        list[torch.Tensor | None],
-        list[torch.Tensor | None],
-    ]:
-        x_tokens, grid_size = self._prepare_video_tokens(
-            x,
-            y,
-            concat_first_frame_latent=concat_first_frame_latent,
-        )
-        if seq_len is None:
-            seq_len = x_tokens.shape[1]
-        if x_tokens.shape[1] != seq_len:
-            raise ValueError(
-                f"seq_len={seq_len} does not match tokens={x_tokens.shape[1]}."
-            )
-
-        clean_tokens = None
-        if clean_x is not None:
-            clean_tokens, clean_grid_size = self._prepare_video_tokens(
-                clean_x,
-                y,
-                concat_first_frame_latent=concat_first_frame_latent,
-            )
-            if not torch.equal(clean_grid_size, grid_size):
-                raise ValueError("clean_x grid size must match x grid size.")
-
-        freqs = self._create_freqs(grid_size, current_start_frame)
-        video_tokens, action_noise_pred, updated_kv_caches, updated_crossattn_caches = (
-            self._forward_blocks(
-                x_tokens,
-                seq_len,
-                freqs,
-                timestep,
-                context,
-                clip_feature,
-                action,
-                timestep_action,
-                state,
-                embodiment_id,
-                kv_cache,
-                crossattn_cache,
-                current_start_frame,
-                clean_tokens=clean_tokens,
-                aug_t=aug_t,
-                is_tf=clean_tokens is not None,
-                image_context_tokens=image_context_tokens,
-                use_crossattn_cache=use_crossattn_cache,
-            )
-        )
         return (
-            self.unpatchify(video_tokens, grid_size),
+            self.unpatchify(x_video, grid_size),
             action_noise_pred,
             updated_kv_caches,
             updated_crossattn_caches,
         )
 
 
-def _current_tp_size() -> int:
-    import phyai.parallel as P
-
-    return P.default_mesh().group_size("dense_tp")
-
-
-def _current_mesh_or_none():
-    import phyai.parallel as P
-
-    return P.default_mesh()
-
-
 def dreamzero_dit_weight_remap(key: str) -> str | None:
-    """Map a DreamZero checkpoint key to the future DiT module namespace.
-
-    The DreamZero-DROID checkpoint stores every component under ``action_head``.
-    The DiT implementation in PhyAI will own only the ``action_head.model``
-    subtree, so this helper strips that prefix and drops text/image/VAE keys.
-    Unknown action-head leaves are dropped until their target module exists.
-    """
+    """Load the ``action_head.model`` subtree into the DreamZero DiT."""
     if key.startswith(_DREAMZERO_DIT_PREFIX):
-        return key[len(_DREAMZERO_DIT_PREFIX) :]
-    for prefix in _DREAMZERO_DROPPED_PREFIXES:
-        if key.startswith(prefix):
-            return None
-    return None
-
-
-def dreamzero_component_from_key(key: str) -> str | None:
-    """Classify a raw DreamZero checkpoint key by high-level component."""
-    if key.startswith(_DREAMZERO_DIT_PREFIX):
-        return "dit"
-    if key.startswith("action_head.text_encoder."):
-        return "text_encoder"
-    if key.startswith("action_head.image_encoder."):
-        return "image_encoder"
-    if key.startswith("action_head.vae."):
-        return "vae"
-    if key.startswith("action_head."):
-        return "action_head_other"
+        return (
+            key.removeprefix(_DREAMZERO_DIT_PREFIX)
+            .replace(".ffn.0.", ".ffn.fc1.")
+            .replace(".ffn.2.", ".ffn.fc2.")
+        )
     return None
 
 
@@ -2122,9 +1252,7 @@ __all__ = [
     "DreamZeroCrossAttention",
     "DreamZeroDiT",
     "DreamZeroDiTBlock",
-    "DreamZeroMLP",
     "DreamZeroSelfAttention",
     "DreamZeroSinusoidalPositionalEncoding",
-    "dreamzero_component_from_key",
     "dreamzero_dit_weight_remap",
 ]

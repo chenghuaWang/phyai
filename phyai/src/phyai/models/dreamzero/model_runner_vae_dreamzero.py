@@ -36,20 +36,13 @@ class DreamZeroVAERunner(ModelRunner):
         use_autocast: bool = True,
     ) -> torch.Tensor:
         pixels = pixels.to(self.device, self.dtype)
-        if use_autocast and self.device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=self.dtype):
-                return self.vae.encode(
-                    pixels,
-                    tiled=tiled,
-                    tile_size=tile_size,
-                    tile_stride=tile_stride,
-                )
-        return self.vae.encode(
-            pixels,
-            tiled=tiled,
-            tile_size=tile_size,
-            tile_stride=tile_stride,
-        )
+        with torch.autocast("cuda", dtype=self.dtype, enabled=use_autocast):
+            return self.vae.encode(
+                pixels,
+                tiled=tiled,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
+            )
 
     @torch.no_grad()
     def decode(

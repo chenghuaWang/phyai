@@ -1,7 +1,7 @@
-"""Minimal DreamZero inference pipeline.
+"""DreamZero inference pipeline.
 
 This module stays at the library boundary: callers provide an already-built
-processor output, encoder runners, and WS1 scheduler. Weight loading and raw
+processor output, encoder runners, and scheduler. Weight loading and raw
 tokenization remain outside this file.
 """
 
@@ -22,10 +22,10 @@ from phyai.models.dreamzero.model_runner_text_encoder_dreamzero import (
     DreamZeroTextEncoderRunner,
 )
 from phyai.models.dreamzero.model_runner_vae_dreamzero import DreamZeroVAERunner
-from phyai.models.dreamzero.scheduler_ws1_dreamzero import (
+from phyai.models.dreamzero.scheduler_dreamzero import (
     DreamZeroRequest,
     DreamZeroSchedulerOutput,
-    DreamZeroWS1Scheduler,
+    DreamZeroScheduler,
 )
 
 
@@ -91,8 +91,8 @@ class DreamZeroPipelineOutput:
     scheduler_output: DreamZeroSchedulerOutput
 
 
-class DreamZeroMinimalPipeline:
-    """Connect DreamZero processor output to text/image/VAE encoders and WS1 DiT."""
+class DreamZeroPipeline:
+    """Encode observations and run the DreamZero denoising scheduler."""
 
     def __init__(
         self,
@@ -101,11 +101,10 @@ class DreamZeroMinimalPipeline:
         text_encoder: DreamZeroTextEncoderRunner | None,
         image_encoder: DreamZeroImageEncoderRunner | None,
         vae: DreamZeroVAERunner | None,
-        scheduler: DreamZeroWS1Scheduler,
+        scheduler: DreamZeroScheduler,
         device: torch.device | str,
         dtype: torch.dtype = torch.bfloat16,
         seed: int | None = None,
-        sequential_cpu_offload: bool = False,
         encoder_rank0_broadcast: bool = False,
     ) -> None:
         self.config = config
@@ -116,9 +115,15 @@ class DreamZeroMinimalPipeline:
         self.device = torch.device(device)
         self.dtype = dtype
         self.seed = seed
-        self.sequential_cpu_offload = bool(sequential_cpu_offload)
         self.encoder_rank0_broadcast = bool(encoder_rank0_broadcast)
         self._condition: DreamZeroFirstFrameCondition | None = None
+
+    def close(self) -> None:
+        self._condition = None
+        self.scheduler.close()
+        for runner in (self.text_encoder, self.image_encoder, self.vae):
+            if runner is not None:
+                runner.close()
 
     @property
     def _is_encoder_rank(self) -> bool:
@@ -127,11 +132,7 @@ class DreamZeroMinimalPipeline:
         return P.default_mesh().group_rank("world") == 0
 
     def _broadcast_encoder_tensor(self, value: torch.Tensor | None) -> torch.Tensor:
-        if not self.encoder_rank0_broadcast:
-            if value is None:
-                raise RuntimeError("encoder returned no tensor")
-            return value.to(self.device, self.dtype)
-        if not dist.is_initialized():
+        if not self.encoder_rank0_broadcast or not dist.is_initialized():
             if value is None:
                 raise RuntimeError("encoder returned no tensor")
             return value.to(self.device, self.dtype)
@@ -158,16 +159,6 @@ class DreamZeroMinimalPipeline:
             raise RuntimeError("encoder source produced no tensor")
         return P.broadcast(value, group="world", src=0)
 
-    def _activate(self, module: torch.nn.Module) -> None:
-        if self.sequential_cpu_offload:
-            module.to(device=self.device, dtype=self.dtype)
-
-    def _offload(self, module: torch.nn.Module) -> None:
-        if self.sequential_cpu_offload:
-            module.to(device="cpu", dtype=self.dtype)
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
-
     def encode_text(
         self, processed: Any, *, use_cfg: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -176,29 +167,15 @@ class DreamZeroMinimalPipeline:
         if self._is_encoder_rank:
             if self.text_encoder is None:
                 raise RuntimeError("encoder rank has no text encoder")
-            self._activate(self.text_encoder.text_encoder)
-            try:
-                encode_positive = getattr(
-                    self.text_encoder,
-                    "encode_positive_prompt",
-                    self.text_encoder.encode_prompt,
+            context = self.text_encoder.forward(
+                _get_field(processed, "input_ids"),
+                _get_field(processed, "attention_mask"),
+            )
+            if use_cfg:
+                uncond_context = self.text_encoder.forward(
+                    _get_field(processed, "negative_input_ids"),
+                    _get_field(processed, "negative_attention_mask"),
                 )
-                context = encode_positive(
-                    _get_field(processed, "input_ids"),
-                    _get_field(processed, "attention_mask"),
-                )
-                if use_cfg:
-                    encode_negative = getattr(
-                        self.text_encoder,
-                        "encode_negative_prompt",
-                        self.text_encoder.encode_prompt,
-                    )
-                    uncond_context = encode_negative(
-                        _get_field(processed, "negative_input_ids"),
-                        _get_field(processed, "negative_attention_mask"),
-                    )
-            finally:
-                self._offload(self.text_encoder.text_encoder)
         return (
             self._broadcast_encoder_tensor(context),
             self._broadcast_encoder_tensor(uncond_context) if use_cfg else None,
@@ -224,49 +201,37 @@ class DreamZeroMinimalPipeline:
         if self._is_encoder_rank:
             if self.image_encoder is None:
                 raise RuntimeError("encoder rank has no image encoder")
-            self._activate(self.image_encoder.image_encoder)
-            try:
-                clip_feature = self.image_encoder.encode_image(
-                    first_frame, preprocessed=False
-                )
-            finally:
-                self._offload(self.image_encoder.image_encoder)
+            clip_feature = self.image_encoder.forward(first_frame, preprocessed=False)
         clip_feature = self._broadcast_encoder_tensor(clip_feature)
-        image_input = first_frame.transpose(1, 2).contiguous()
-        image_zeros = torch.zeros(
-            batch_size,
-            channels,
-            self.config.num_frames - 1,
-            height,
-            width,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        vae_input = torch.cat(
-            [image_input.to(self.device, self.dtype), image_zeros],
-            dim=2,
-        )
         latents = None
         if self._is_encoder_rank:
             if self.vae is None:
                 raise RuntimeError("encoder rank has no VAE")
-            self._activate(self.vae.vae)
-            try:
-                latents = self.vae.encode(
-                    vae_input,
-                    tiled=self.config.tiled,
-                    tile_size=(
-                        self.config.tile_size_height,
-                        self.config.tile_size_width,
-                    ),
-                    tile_stride=(
-                        self.config.tile_stride_height,
-                        self.config.tile_stride_width,
-                    ),
-                    use_autocast=True,
-                )
-            finally:
-                self._offload(self.vae.vae)
+            image_zeros = torch.zeros(
+                batch_size,
+                channels,
+                self.config.num_frames - 1,
+                height,
+                width,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            vae_input = torch.cat(
+                [frame.to(self.device, self.dtype), image_zeros], dim=2
+            )
+            latents = self.vae.encode(
+                vae_input,
+                tiled=self.config.tiled,
+                tile_size=(
+                    self.config.tile_size_height,
+                    self.config.tile_size_width,
+                ),
+                tile_stride=(
+                    self.config.tile_stride_height,
+                    self.config.tile_stride_width,
+                ),
+                use_autocast=True,
+            )
         latents = self._broadcast_encoder_tensor(latents)
         mask = torch.zeros(
             batch_size,
@@ -279,9 +244,9 @@ class DreamZeroMinimalPipeline:
         )
         mask[:, :, 0:1] = 1
         return DreamZeroFirstFrameCondition(
-            clip_feature=clip_feature.to(self.device, self.dtype),
-            y=torch.cat([mask, latents], dim=1).to(self.device, self.dtype),
-            clean_video=latents[:, :, 0:1].to(self.device, self.dtype),
+            clip_feature=clip_feature,
+            y=torch.cat([mask, latents], dim=1),
+            clean_video=latents[:, :, 0:1],
         )
 
     def encode_reference_video(self, videos: torch.Tensor) -> torch.Tensor:
@@ -319,27 +284,21 @@ class DreamZeroMinimalPipeline:
         if self._is_encoder_rank:
             if self.vae is None:
                 raise RuntimeError("encoder rank has no VAE")
-            self._activate(self.vae.vae)
-            try:
-                latents = self.vae.encode(
-                    vae_input,
-                    tiled=self.config.tiled,
-                    tile_size=(
-                        self.config.tile_size_height,
-                        self.config.tile_size_width,
-                    ),
-                    tile_stride=(
-                        self.config.tile_stride_height,
-                        self.config.tile_stride_width,
-                    ),
-                    use_autocast=False,
-                )
-            finally:
-                self._offload(self.vae.vae)
+            latents = self.vae.encode(
+                vae_input,
+                tiled=self.config.tiled,
+                tile_size=(
+                    self.config.tile_size_height,
+                    self.config.tile_size_width,
+                ),
+                tile_stride=(
+                    self.config.tile_stride_height,
+                    self.config.tile_stride_width,
+                ),
+                use_autocast=False,
+            )
         latents = self._broadcast_encoder_tensor(latents)
-        return latents[:, :, -self.config.num_frame_per_block :].to(
-            self.device, self.dtype
-        )
+        return latents[:, :, -self.config.num_frame_per_block :]
 
     def build_request(
         self,
@@ -355,10 +314,10 @@ class DreamZeroMinimalPipeline:
     ) -> DreamZeroRequest:
         images = _get_field(processed, "images")
         if images is None:
-            raise ValueError("DreamZero minimal pipeline requires processed.images.")
+            raise ValueError("DreamZero pipeline requires processed.images.")
         state = _get_field(processed, "state")
         if state is None:
-            raise ValueError("DreamZero minimal pipeline requires processed.state.")
+            raise ValueError("DreamZero pipeline requires processed.state.")
         embodiment_id = _get_field(processed, "embodiment_id")
 
         videos = dreamzero_images_to_video_tensor(
@@ -390,12 +349,8 @@ class DreamZeroMinimalPipeline:
             start_frame = 0
         reset_sequence = start_frame == 0 if reset_kv_cache is None else reset_kv_cache
         if reset_sequence:
-            # Release the previous attention window before image/VAE
-            # reconditioning. Waiting until scheduler.step() keeps both the old
-            # multi-gigabyte KV cache and the new encoder working set alive.
+            # Release the previous window's KV tensors before re-encoding.
             self.scheduler.reset_sequence()
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
         if reset_sequence or self._condition is None:
             condition = self.encode_first_frame_condition(videos)
             self._condition = condition
@@ -427,7 +382,6 @@ class DreamZeroMinimalPipeline:
             device=self.device,
             dtype=self.dtype,
         )
-        seq_len = self.config.num_frame_per_block * (latent_h // 2) * (latent_w // 2)
         return DreamZeroRequest(
             video=noise_video,
             action=noise_action,
@@ -444,9 +398,7 @@ class DreamZeroMinimalPipeline:
             reference_video=reference_video,
             uncond_context=uncond_context,
             uncond_clip_feature=condition.clip_feature if use_cfg else None,
-            seq_len=seq_len,
             current_start_frame=start_frame,
-            concat_first_frame_latent=True,
             image_context_tokens=condition.clip_feature.shape[1],
             num_inference_steps=num_inference_steps,
             dynamic_dit=dynamic_dit,
@@ -480,11 +432,7 @@ class DreamZeroMinimalPipeline:
             dynamic_dit_scheduler_steps=dynamic_dit_scheduler_steps,
             reset_kv_cache=reset_kv_cache,
         )
-        self._activate(self.scheduler.model)
-        try:
-            scheduler_output = self.scheduler.step(request)
-        finally:
-            self._offload(self.scheduler.model)
+        scheduler_output = self.scheduler.step(request)
         return DreamZeroPipelineOutput(
             video=scheduler_output.video,
             action=scheduler_output.action,
@@ -495,7 +443,7 @@ class DreamZeroMinimalPipeline:
 
 __all__ = [
     "DreamZeroFirstFrameCondition",
-    "DreamZeroMinimalPipeline",
+    "DreamZeroPipeline",
     "DreamZeroPipelineOutput",
     "dreamzero_generate_noise",
     "dreamzero_images_to_video_tensor",
