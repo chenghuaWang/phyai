@@ -39,20 +39,20 @@ fused-add path today (encoder paths don't need one). AdaRMSNorm's
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union, Optional
 
 import torch
 import torch.nn as nn
 
-from phyai.engine_config import get_engine_config
 from phyai.kernel.call import (
     CallSite,
-    backend_preference,
-    param_dtypes,
     token_shape,
     torch_dtype,
+    param_dtypes,
+    backend_preference,
 )
 from phyai.kernel.types import dtype_name
+from phyai.engine_config import get_engine_config
 from phyai.layers.linear import ReplicatedLinear
 from phyai.weights.shards import replicated
 
@@ -100,8 +100,12 @@ class RMSNorm(nn.Module):
       are written in place by the kernel and the same objects come back.
 
     On the no-residual path, higher-rank inputs are flattened to 2-D for
-    the kernel and reshaped back. The residual path expects 2-D contiguous
-    inputs (the kernels themselves don't know how to reshape).
+    the kernel and reshaped back. ``preserve_3d_layout=True`` instead passes
+    a 3-D input with unit last-dimension stride to the selected kernel.
+    FlashInfer RMSNorm can normalize these rows directly; Gemma and fallback
+    implementations may materialize a contiguous input internally. The option
+    is explicit so existing callers retain their original kernel and rounding behavior.
+    It cannot be combined with the in-place residual path.
     """
 
     def __init__(
@@ -180,7 +184,16 @@ class RMSNorm(nn.Module):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        *,
+        preserve_3d_layout: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if preserve_3d_layout and (
+            residual is not None or x.dim() != 3 or x.stride(-1) != 1
+        ):
+            raise ValueError(
+                "preserve_3d_layout requires a 3-D input with unit last stride "
+                "and no residual"
+            )
         if self.cast_before_affine and self.weight.dtype != x.dtype:
             raise ValueError(
                 "cast_before_affine requires matching activation and weight dtypes"
@@ -228,8 +241,13 @@ class RMSNorm(nn.Module):
             device=x.device,
             dtype=dtypes,
             dims=token_shape(x),
-            attrs={"variant": self.variant},
+            attrs={"variant": self.variant, "rank": 3 if preserve_3d_layout else 2},
         )
+        if preserve_3d_layout:
+            out = handle.execute(x, weight.data, self.variance_epsilon)
+            if self.cast_before_affine:
+                out = out * self.weight
+            return out
         needs_reshape = x.dim() != 2
         if needs_reshape:
             orig_shape = x.shape

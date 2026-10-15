@@ -12,7 +12,7 @@ from phyai.kernel.opspec import (
     matches_activation,
 )
 from phyai.kernel.registry import Catalog
-from phyai.kernel.predicate import all_of, implies
+from phyai.kernel.predicate import all_of, any_of, implies
 
 NVIDIA = device.vendor == "nvidia"
 NVIDIA_FLASHINFER = lib.has("flashinfer") & NVIDIA
@@ -46,6 +46,10 @@ def _bench_dims(facts) -> tuple[int, int]:
 
 
 def _bench_rmsnorm(facts, device):
+    if facts.lookup("attrs.rank") == 3:
+        # A dense 2-D sample cannot represent the 3-D row gaps. Keep the
+        # policy order until this benchmark can synthesize the actual layout.
+        raise NotImplementedError("3-D RMSNorm layout is not synthesized")
     tokens, hidden = _bench_dims(facts)
     x = _bench_tensor(facts, device, "input", tokens, hidden)
     weight = _bench_tensor(facts, device, "weight", hidden)
@@ -87,6 +91,7 @@ RMSNORM = OpSpec(
     dims=("tokens", "hidden"),
     dtypes=("input", "weight"),
     attributes=("variant",),
+    optional_attributes=("rank",),
     params=("weight",),
     signature="(x, weight, eps) -> Tensor",
     bench_args=_bench_rmsnorm,
@@ -161,16 +166,32 @@ FLASHINFER_LAYERNORM = all_of(
 )
 
 TRITON_NORM = all_of(NVIDIA_TRITON, dtype.input.in_(TRITON_FLOATS))
+RMSNORM_LAYOUT = any_of(attrs.rank.is_none(), attrs.rank.in_({2, 3}))
 
 
 def _gemma(facts) -> bool:
     return facts.lookup("attrs.variant") == "gemma"
 
 
+def _rmsnorm_flattened(function):
+    def wrapped(x, weight, eps):
+        original_shape = x.shape
+        flattened = x.contiguous().view(-1, original_shape[-1])
+        return function(flattened, weight, eps).view(original_shape)
+
+    return wrapped
+
+
 def _flashinfer_rmsnorm(facts, params):
     from flashinfer.norm import rmsnorm, gemma_rmsnorm
 
-    return gemma_rmsnorm if _gemma(facts) else rmsnorm
+    if _gemma(facts):
+        # Gemma's CUDA JIT fallback accepts 2-D input even though its CuTe
+        # implementation supports 3-D input. Keep both paths compatible.
+        if facts.lookup("attrs.rank") == 3:
+            return _rmsnorm_flattened(gemma_rmsnorm)
+        return gemma_rmsnorm
+    return rmsnorm
 
 
 def _flashinfer_rmsnorm_add(facts, params):
@@ -189,7 +210,12 @@ def _flashinfer_rmsnorm_add(facts, params):
 def _triton_rmsnorm(facts, params):
     from phyai_kernel import rmsnorm, gemma_rmsnorm
 
-    return gemma_rmsnorm if _gemma(facts) else rmsnorm
+    function = gemma_rmsnorm if _gemma(facts) else rmsnorm
+    if facts.lookup("attrs.rank") == 3:
+        # Pass contiguous output geometry to the 2-D Triton implementation;
+        # arbitrary outer strides can otherwise make its output reshape copy.
+        return _rmsnorm_flattened(function)
+    return function
 
 
 def _triton_rmsnorm_add(facts, params):
@@ -329,7 +355,7 @@ def register(catalog: Catalog) -> None:
                 kernel_id="flashinfer.rmsnorm",
                 op="rmsnorm",
                 priority=Priority.OPTIMIZED + 2,
-                when=FLASHINFER_RMSNORM,
+                when=all_of(FLASHINFER_RMSNORM, RMSNORM_LAYOUT),
                 prepare=_flashinfer_rmsnorm,
                 # Allocate gamma in the activation dtype.
                 params={"weight": matches_activation()},
@@ -338,7 +364,7 @@ def register(catalog: Catalog) -> None:
                 kernel_id="phyai_kernel.rmsnorm",
                 op="rmsnorm",
                 priority=Priority.OPTIMIZED,
-                when=TRITON_NORM,
+                when=all_of(TRITON_NORM, RMSNORM_LAYOUT),
                 prepare=_triton_rmsnorm,
                 params={"weight": any_float()},
             ),
@@ -347,7 +373,7 @@ def register(catalog: Catalog) -> None:
                 op="rmsnorm",
                 priority=Priority.REFERENCE,
                 reference=True,
-                when=dtype.input.is_set(),
+                when=all_of(dtype.input.is_set(), RMSNORM_LAYOUT),
                 prepare=_torch_rmsnorm,
                 params={"weight": any_float()},
             ),
