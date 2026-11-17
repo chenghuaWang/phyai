@@ -28,7 +28,7 @@ import { ModelCard } from "/snippets/model-card.jsx"
 
 本页文档专注于 `ws1` 即 `world_size=1`,单 rank、不走分布式。本页全部内容都围绕这套单卡配置。 `entry` 是 `PI05Scheduler`。
 
-![PI0.5 模型执行流程](/images/models/pi05/inference_pipeline.svg)
+![PI0.5 模型执行流程](../../../images/models/pi05/inference_pipeline.svg)
 
 # 架构
 
@@ -48,7 +48,7 @@ PhyAI 的 <Tooltip headline="Engine + plugin" tip="Engine.__init__ 按固定顺�
 
 下面这张动图展示了 phyai 的 3 个 model runner 是怎么和 scheduler 协作的,以及 engine 初始化是怎么衔接到 `scheduler.setup()` 和 `scheduler.step()` 的。
 
-![PhyAI Engine ↔ Scheduler ↔ 3 Runners 生命周期](/images/models/pi05/engine_lifecycle.svg)
+![PhyAI Engine ↔ Scheduler ↔ 3 Runners 生命周期](../../../images/models/pi05/engine_lifecycle.svg)
 
 # 运行 pi0.5
 

@@ -353,7 +353,7 @@ if __name__ == "__main__":
     main()
 ```
 
-`engine.step()` hands back a CUDA-IPC view of the tensor on the output rank's GPU; the postprocessor copies it to the CPU, so saving works as before. Cosmos3 accepts `cfg_size` 1 or 2 and any `tp_size` that divides both the attention heads and the KV heads (1, 2, 4, or 8 for Cosmos3-Nano), with dense and attention TP kept equal. Other parallel axes are rejected before a worker starts. Serving replicas and `torchrun` launches are covered in [Parallel serving](/deployment/parallel-serving).
+`engine.step()` hands back a CUDA-IPC view of the tensor on the output rank's GPU; the postprocessor copies it to the CPU, so saving works as before. Cosmos3 accepts `cfg_size` 1 or 2 and any `tp_size` that divides both the attention heads and the KV heads (1, 2, 4, or 8 for Cosmos3-Nano), with dense and attention TP kept equal. Other parallel axes are rejected before a worker starts. Serving replicas and `torchrun` launches are covered in [Parallel serving](../../deployment/parallel-serving.mdx).
 
 # Full example
 

@@ -6,7 +6,7 @@ description: "运行 VPP2 动作与视频推理，配置 CFG 和张量并行。"
 `vpp2` 插件支持 [VPP2](https://github.com/roboterax/video-prediction-policy-2)
 的 RoboDojo、LIBERO 动作策略和独立视频预测。
 
-准备好 PhyAI [CUDA 环境](/zh/index#安装)和完整的 VPP2 发布目录，
+准备好 PhyAI [CUDA 环境](../../index.mdx#安装)和完整的 VPP2 发布目录，
 包括 `config.json`、Wan 资源、tokenizer、模型权重和 `dataset_stats.json`。
 以下命令均在 PhyAI 仓库根目录运行。
 
@@ -99,4 +99,4 @@ RoboDojo 测试使用单张 **NVIDIA H200** GPU、`240 × 416` 分辨率、17 �
 下方折线图记录依赖升级前的优化阶段，使用 FlashInfer **0.6.17** 和
 Humming **0.1.16**：
 
-![VPP2 优化阶段：已编码输入的推理耗时，以及单独计时的观测到动作路径。](/images/models/vpp2/acceleration.png)
+![VPP2 优化阶段：已编码输入的推理耗时，以及单独计时的观测到动作路径。](../../../images/models/vpp2/acceleration.png)

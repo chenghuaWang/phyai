@@ -27,7 +27,7 @@ import { ModelCard } from "/snippets/model-card.jsx"
 
 Cosmos3 的 policy 路径和文生视频不是一回事。它是模型里会看场景、会读任务、会想下一步怎么动的那部分。给它一帧 observation 和一句任务，它预测一段 action chunk；给它一段 action，它推演一个可能的未来；给它一段已经发生的 transition，它反推中间用了什么动作。
 
-这一页用的是 <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a>。想要 action 输出时，别拿通用的 `Cosmos3-Nano` 生成 checkpoint 来代替；那条路在 [Cosmos3 生成模式](/zh/models/cosmos/generation)。
+这一页用的是 <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a>。想要 action 输出时，别拿通用的 `Cosmos3-Nano` 生成 checkpoint 来代替；那条路在 [Cosmos3 生成模式](generation.mdx)。
 
 一个 `cosmos3_policy` 插件承担三种 mode，单卡多卡都行：
 
@@ -434,7 +434,7 @@ if __name__ == "__main__":
     main()
 ```
 
-`engine.step()` 返回的是 output rank 上张量的 CUDA-IPC view，postprocessor 会把 action 搬到 CPU，有像素时一起搬。`tp_size` 要同时整除 attention head 数和 KV head 数（这个 checkpoint 是 1、2、4 或 8），dense 与 attention 的 TP 保持一致。多副本和外部启动器见 [并行服务](/zh/deployment/parallel-serving)。
+`engine.step()` 返回的是 output rank 上张量的 CUDA-IPC view，postprocessor 会把 action 搬到 CPU，有像素时一起搬。`tp_size` 要同时整除 attention head 数和 KV head 数（这个 checkpoint 是 1、2、4 或 8），dense 与 attention 的 TP 保持一致。多副本和外部启动器见 [并行服务](../../deployment/parallel-serving.mdx)。
 
 # 完整代码
 

@@ -7,7 +7,7 @@ Give Xiaomi-Robotics-U0-4B one reference image and a text instruction. PhyAI enc
 
 ## Edit an image
 
-Set up the [checkpoints and environment](/models/xiaomi-u0/text-to-image#prepare-the-models), then run this command from the PhyAI repository root. Use a new or empty output directory.
+Set up the [checkpoints and environment](text-to-image.mdx#prepare-the-models), then run this command from the PhyAI repository root. Use a new or empty output directory.
 
 ```bash
 PHYAI_FLASHINFER_WORKSPACE_BYTES=1073741824 \
@@ -24,7 +24,7 @@ The example uses a 1 GiB FlashInfer workspace for the image-conditioned prompt. 
 
 ## Read the output
 
-Open `outputs/u0-stoneware/image.png` to view the edit. The example writes the usual [generation files](/models/xiaomi-u0/text-to-image#read-the-output) and saves the reference grid to `reference_codes.npy`. Both `input_ids.npy` and `unconditional_ids.npy` include the reference image. Only the conditional prompt contains the editing instruction.
+Open `outputs/u0-stoneware/image.png` to view the edit. The example writes the usual [generation files](text-to-image.mdx#read-the-output) and saves the reference grid to `reference_codes.npy`. Both `input_ids.npy` and `unconditional_ids.npy` include the reference image. Only the conditional prompt contains the editing instruction.
 
 Use `--prepare-only` with `--reference-image` to save the reference codes and prompt tokens before autoregressive generation. This mode uses the vision encoder and requires `--vision-tokenizer-dir`.
 

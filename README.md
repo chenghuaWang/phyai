@@ -15,6 +15,24 @@ models, including policy and action models used in interactive systems.
   <img src="assets/phyai-demo.gif" alt="PhyAI and OpenPI deployment comparison" width="100%">
 </p>
 
+## News
+
+- [2026/11] Support inference on [AMD Instinct MI300X](docs/deployment/amd-rocm.mdx) (experimental).
+- [2026/11] Support [VPP2](docs/models/vpp2/inference.mdx) action and video inference with TP and video CFG parallelism.
+- [2026/11] Support [HumanWAM-Goal](docs/models/humanwam-goal/inference.mdx).
+- [2026/11] Support [LingBot V2](docs/models/lingbot_v2/inference.mdx).
+- [2026/10] Support [DreamZero](docs/models/dreamzero/ws1.mdx).
+- [2026/10] Support [Xiaomi Robotics U0](docs/models/xiaomi-u0/text-to-image.mdx) text-to-image generation.
+- [2026/10] Support [MolmoAct2](docs/models/molmoact2/inference.mdx).
+- [2026/10] Support [PhyAI gateway](docs/deployment/server-gateway.mdx) for multi-host serving and LeRobot clients.
+- [2026/09] Support [Qwen-Image 2.1](docs/models/qwen-image/generation.mdx).
+- [2026/09] Support PI0.5 RL rollout for PPO with RLinf.
+- [2026/07] Day 0 support for [MiniCPM-Robotic](examples/minicpm_gr00t/README.md).
+- [2026/07] Introducing PhyAI, a latency-first serving engine for Physical AI.
+- [2026/07] Support [PI0](docs/models/pi0/ws1.mdx).
+- [2026/07] Support Cosmos3-Super with TP and CFG parallelism in the unified Cosmos3 [generation path](docs/models/cosmos/generation.mdx).
+- [2026/06] Support [Pi0.5](docs/models/pi05/ws1.mdx) and Cosmos3-Nano's [policy mode](docs/models/cosmos/policy.mdx) and [generation mode](docs/models/cosmos/generation.mdx).
+
 ## Key Features
 
 - Runs on NVIDIA Jetson edge devices

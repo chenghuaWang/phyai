@@ -27,7 +27,7 @@ import { ModelCard } from "/snippets/model-card.jsx"
 
 Cosmos3's policy path is a different animal from text-to-video. It is the part of the model that looks at a scene, reads a task, and works out what to do. Give it an observation and a prompt and it predicts an action chunk. Give it an action and it rolls out a plausible future. Give it a transition that already happened and it infers the action in between.
 
-This page uses <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a>. Do not swap in the general `Cosmos3-Nano` generation checkpoint when you want actions; that path lives in [Cosmos3 Generation Mode](/models/cosmos/generation).
+This page uses <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a>. Do not swap in the general `Cosmos3-Nano` generation checkpoint when you want actions; that path lives in [Cosmos3 Generation Mode](generation.mdx).
 
 One plugin, `cosmos3_policy`, serves three modes on one GPU or several:
 
@@ -434,7 +434,7 @@ if __name__ == "__main__":
     main()
 ```
 
-`engine.step()` returns CUDA-IPC views of the output rank's tensors; the postprocessor moves the action, and the pixels when there are any, to the CPU. `tp_size` must divide both the attention heads and the KV heads (1, 2, 4, or 8 for this checkpoint), with dense and attention TP kept equal. Replicas and external launchers are covered in [Parallel serving](/deployment/parallel-serving).
+`engine.step()` returns CUDA-IPC views of the output rank's tensors; the postprocessor moves the action, and the pixels when there are any, to the CPU. `tp_size` must divide both the attention heads and the KV heads (1, 2, 4, or 8 for this checkpoint), with dense and attention TP kept equal. Replicas and external launchers are covered in [Parallel serving](../../deployment/parallel-serving.mdx).
 
 # Full example
 

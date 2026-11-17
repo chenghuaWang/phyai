@@ -28,7 +28,7 @@ import { ModelCard } from "/snippets/model-card.jsx"
 
 This page focuses on `ws1`, i.e. `world_size=1` — a single rank with no distributed setup. Everything on this page targets this single-card configuration. The `entry` is `PI05Scheduler`.
 
-![PI0.5 model execution pipeline](/images/models/pi05/inference_pipeline.svg)
+![PI0.5 model execution pipeline](../../images/models/pi05/inference_pipeline.svg)
 
 # Architecture
 
@@ -48,7 +48,7 @@ PhyAI's <Tooltip headline="Engine + plugin" tip="Engine.__init__ runs a fixed se
 
 The diagram below illustrates how phyai's three model runners cooperate with the scheduler, and how the engine bootstrap hands off to `scheduler.setup()` and `scheduler.step()`.
 
-![PhyAI Engine ↔ Scheduler ↔ 3 Runners lifecycle](/images/models/pi05/engine_lifecycle.svg)
+![PhyAI Engine ↔ Scheduler ↔ 3 Runners lifecycle](../../images/models/pi05/engine_lifecycle.svg)
 
 # Running pi0.5
 

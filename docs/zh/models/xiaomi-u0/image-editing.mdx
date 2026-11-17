@@ -7,7 +7,7 @@ description: "在 PhyAI 中使用 Xiaomi-Robotics-U0-4B 编辑参考图。"
 
 ## 编辑图片
 
-按[文生图指南](/zh/models/xiaomi-u0/text-to-image#准备模型)准备环境和权重。然后在 PhyAI 仓库根目录运行以下命令，并指定一个新目录或空目录保存结果。
+按[文生图指南](text-to-image.mdx#准备模型)准备环境和权重。然后在 PhyAI 仓库根目录运行以下命令，并指定一个新目录或空目录保存结果。
 
 ```bash
 PHYAI_FLASHINFER_WORKSPACE_BYTES=1073741824 \
@@ -24,7 +24,7 @@ uv run --locked python examples/xiaomi_u0/run_xiaomi_u0.py \
 
 ## 查看输出
 
-打开 `outputs/u0-stoneware/image.png` 查看编辑结果。除了[文生图的输出文件](/zh/models/xiaomi-u0/text-to-image#查看输出)，目录里还会多一个 `reference_codes.npy`，记录参考图的视觉码网格。两路 CFG 输入都包含参考图，只有有条件分支包含编辑指令。
+打开 `outputs/u0-stoneware/image.png` 查看编辑结果。除了[文生图的输出文件](text-to-image.mdx#查看输出)，目录里还会多一个 `reference_codes.npy`，记录参考图的视觉码网格。两路 CFG 输入都包含参考图，只有有条件分支包含编辑指令。
 
 加上 `--prepare-only` 可以只保存参考图的视觉码和提示词 token。此时仍需用 `--vision-tokenizer-dir` 提供视觉编码器权重。
 

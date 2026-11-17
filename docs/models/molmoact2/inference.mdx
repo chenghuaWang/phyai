@@ -30,7 +30,7 @@ returns 15 actions with 8 values per action.
 ## Quickstart
 
 Use Linux, Python 3.12 or newer, `uv`, and an NVIDIA GPU with BF16 support and
-enough free memory to load the model. See [installation](/index#setup) for the
+enough free memory to load the model. See [installation](../../index.mdx#setup) for the
 CUDA environment. Run the commands below from the provided source directory.
 
 <Steps>
@@ -308,4 +308,4 @@ Continuous actions require an action expert and `action_mode="continuous"` or
 `"both"`. The low-level API also exposes `MolmoAct2GenerationRequest` for greedy
 token IDs; the action examples above use `MolmoAct2Request` and its processor.
 
-For deployment beyond a local process, see [parallel serving](/deployment/parallel-serving).
+For deployment beyond a local process, see [parallel serving](../../deployment/parallel-serving.mdx).

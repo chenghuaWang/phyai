@@ -353,7 +353,7 @@ if __name__ == "__main__":
     main()
 ```
 
-`engine.step()` 交回来的是 output rank 那张卡上张量的 CUDA-IPC view，postprocessor 会把它拷到 CPU，保存和单卡一样。Cosmos3 接受 `cfg_size` 为 1 或 2，`tp_size` 要同时整除 attention head 数和 KV head 数（Cosmos3-Nano 是 1、2、4 或 8），dense 与 attention 的 TP 保持一致。其他并行轴在 worker 启动前就会被拒绝。多副本和 `torchrun` 启动见 [并行服务](/zh/deployment/parallel-serving)。
+`engine.step()` 交回来的是 output rank 那张卡上张量的 CUDA-IPC view，postprocessor 会把它拷到 CPU，保存和单卡一样。Cosmos3 接受 `cfg_size` 为 1 或 2，`tp_size` 要同时整除 attention head 数和 KV head 数（Cosmos3-Nano 是 1、2、4 或 8），dense 与 attention 的 TP 保持一致。其他并行轴在 worker 启动前就会被拒绝。多副本和 `torchrun` 启动见 [并行服务](../../deployment/parallel-serving.mdx)。
 
 # 完整代码
 
