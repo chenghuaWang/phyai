@@ -2,7 +2,7 @@
 
 https://arxiv.org/abs/2302.04867
 
-TODO(wch): make this scheduler public for other models.
+TODO: make this scheduler public for other models.
 """
 
 from __future__ import annotations

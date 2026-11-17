@@ -631,7 +631,7 @@ class Qwen3VLTextModel(nn.Module):
             prefix=f"{prefix}.embed_tokens" if prefix else "",
             device=device,
         )
-        # TODO(wch): rope kernel can be fused here. currently fail back to eager.
+        # TODO: rope kernel can be fused here. currently fail back to eager.
         self.rotary_emb = InterleavedMRotaryEmbedding(
             head_dim=config.head_dim,
             max_position_embeddings=config.max_position_embeddings,

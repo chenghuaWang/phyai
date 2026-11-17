@@ -366,7 +366,7 @@ class MiniCPMGR00TModelRunner(ModelRunner):
             tuple(graph_inputs["pixel_values"].shape),
             source_sizes,
         )
-        # TODO(yuezhi): Clone VLM graph outputs if callers retain them across replays.
+        # TODO: Clone VLM graph outputs if callers retain them across replays.
         if self.use_cuda_graph:
             graph = self._vlm_graphs.get(graph_key)
             if graph is not None:
