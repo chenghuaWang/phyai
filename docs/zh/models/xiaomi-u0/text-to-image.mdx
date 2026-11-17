@@ -115,4 +115,3 @@ token 生成使用 BF16、FlashInfer 分页注意力和无文本条件的 CFG，
 
 上面的三个提示词均在 NVIDIA Thor 上通过 FlashInfer 和 PhyAI 原生解码器完成生成，返回 EOS、完整的 4169 个 token 和 1024 × 1024 RGB 图片。
 固定历史的自回归短回放通过近似精度检查；原生解码器对一组保存的视觉码完成了参考对照，输出误差在测试容差内。
-详细的比较方法和指标见 [PR #71](https://github.com/mingti-org/phyai/pull/71)。

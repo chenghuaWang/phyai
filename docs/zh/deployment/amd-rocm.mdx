@@ -11,11 +11,9 @@ PhyAI 在 AMD Instinct MI300X（gfx942）上以 eager 与 CUDA Graph 模式运�
 
 启动镜像并透传 GPU 设备（`--device=/dev/kfd --device=/dev/dri`）。镜像在 `/opt/venv` 里带 ROCm 版 Torch、TorchVision、Triton 与 aiter，Torch 版本与 PhyAI 固定的版本一致。
 
-`phyai/pyproject_amd.toml` 与 `phyai-kernel/pyproject_amd.toml` 声明的依赖与默认的 `pyproject.toml` 相同，只去掉了仅支持 CUDA 的包。把它们拷成默认文件，再把 workspace 包装进镜像的环境：
+`phyai/pyproject_amd.toml` 与 `phyai-kernel/pyproject_amd.toml` 声明的依赖与默认的 `pyproject.toml` 相同，只去掉了仅支持 CUDA 的包。在提供的源码根目录，把它们拷成默认文件，再把 workspace 包装进镜像的环境：
 
 ```bash
-git clone https://github.com/mingti-org/phyai.git
-cd phyai
 cp phyai/pyproject_amd.toml phyai/pyproject.toml
 cp phyai-kernel/pyproject_amd.toml phyai-kernel/pyproject.toml
 source /opt/venv/bin/activate

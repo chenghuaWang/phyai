@@ -114,8 +114,17 @@ Testing/
 .DS_Store
 Thumbs.db
 
-# Claude / agents
+# Agent settings and private working files
 .claude/
+.agents/
+.codex/
+.memory/
+.profile/
+.profile*/
+.auto_research/
+.mimocode/
+profile/
+docs/compose/
 
 # Repo-local docs & examples (not needed at runtime)
 docs/

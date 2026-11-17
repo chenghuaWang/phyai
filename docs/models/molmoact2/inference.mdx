@@ -18,7 +18,7 @@ returns 15 actions with 8 values per action.
 | Input | Three RGB camera slots, an 8-value state vector, and a task instruction |
 | Output | A CPU `float32` action tensor shaped `(1, 15, 8)` after postprocessing |
 | Inference | BF16, 10 flow-matching steps, CUDA Graph enabled |
-| Example script | [run_molmoact2.py](https://github.com/mingti-org/phyai/blob/main/examples/molmoact2/run_molmoact2.py) |
+| Example script | `examples/molmoact2/run_molmoact2.py` |
 
 <Note>
   `allenai/MolmoAct2` is a multi-embodiment foundation checkpoint intended for
@@ -31,14 +31,12 @@ returns 15 actions with 8 values per action.
 
 Use Linux, Python 3.12 or newer, `uv`, and an NVIDIA GPU with BF16 support and
 enough free memory to load the model. See [installation](/index#setup) for the
-CUDA environment. The commands below run from the PhyAI repository root.
+CUDA environment. Run the commands below from the provided source directory.
 
 <Steps>
 <Step title="Install PhyAI">
 
 ```bash
-git clone https://github.com/mingti-org/phyai
-cd phyai
 uv sync
 source .venv/bin/activate
 ```

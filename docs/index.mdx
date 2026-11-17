@@ -1,36 +1,28 @@
 ---
-title: "Welcome to PhyAI"
-description: "Building AGI, Together."
+title: "Inference framework"
+description: "Install the submitted source and run Physical AI models."
 icon: 'star'
 mode: "wide"
 ---
 
 import { SetupCard } from "/snippets/setup-card.jsx"
 
-# What is PhyAI
+# Overview
 
-**PhyAI** (**Phy**sical **AI** Inference Framework, pronounced “phi”) is a high-performance framework for running Physical AI models, including VLAs, WAMs, and beyond. It supports both cloud-based serving and on-device deployment.
+`phyai` runs Physical AI models, including vision-language-action models and world action models, on edge devices and GPU servers.
 
 # Setup
+
+Run these commands from the provided source directory.
 
 <SetupCard
   rows={{
     "OS": ["Ubuntu"],
     "Package": [
-      ["Package", "not upload to pypi yet"],
-      ["Source", `git clone https://github.com/mingti-org/phyai
-cd phyai
-uv sync
-source .venv/bin/activate`],
-      ["Docker", "not upload yet"]
+      ["Source", `uv sync
+source .venv/bin/activate`]
     ],
     "Device": ["Cloud/Consumer"],
     "Compute Platform": ["CUDA 13.0"],
   }}
 />
-
-If you want to install nightly version of phyai, pls using packages below:
-
-```shell
-uv pip install phyai phyai_ext --extra-index-url https://mingti-org.github.io/phyai/simple/ --prerelease=allow
-```

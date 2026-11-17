@@ -4,13 +4,12 @@ To simplify developers' experience with phyai, we provide ready-to-use Dockerfil
 
 ## 1. Using Dockerfile
 
-```bash
-git clone https://github.com/mingti-org/phyai.git
-cd phyai/docker
+Run these commands from the provided source directory. The build uses that local source as its context.
 
-# NVIDIA GPU. Chose your CUDA version: Dockerfile.cuxxx
-docker build -t phyai_torch211cu13 -f Dockerfile.torch211cu13 .
-docker run -it --gpus all --cap-add=SYS_ADMIN --network=host --cap-add=SYS_PTRACE --shm-size=4G --security-opt seccomp=unconfined --security-opt apparmor=unconfined --name phyai_torch211cu13_dev phyai_torch211cu13 bash
+```bash
+# NVIDIA GPU: choose the Dockerfile for your CUDA version.
+docker build -f docker/Dockerfile.torch211cu13 -t phyai:torch211-cu13 .
+docker run -it --gpus all --cap-add=SYS_ADMIN --network=host --cap-add=SYS_PTRACE --shm-size=4G --security-opt seccomp=unconfined --security-opt apparmor=unconfined --name phyai_torch211cu13_dev phyai:torch211-cu13 bash
 ```
 
 ## 2. Using DevContainer
@@ -22,19 +21,13 @@ To set up with VS Code Dev Containers:
     - VS Code
     - Dev Containers extension
 
-2. Clone repository with submodules:
+2. Open the provided source directory in VS Code:
 
     ```shell
-    git clone --recursive https://github.com/mingti-org/phyai.git
+    code .
     ```
 
-3. Open project in VS Code:
-
-    ```shell
-    code phyai
-    ```
-
-4. When prompted:
+3. When prompted:
 
     "Folder contains a Dev Container configuration file. Reopen in container?"
     Click Reopen in Container

@@ -1,6 +1,7 @@
 {
     "name": "phyai-torch211-cu13",
     "build": {
+        "context": "../..",
         "dockerfile": "../../docker/Dockerfile.torch211cu13"
     },
     "customizations": {

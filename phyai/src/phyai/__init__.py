@@ -12,7 +12,7 @@ except PackageNotFoundError:  # raw source tree, not installed
     __version__ = "0.0.0+unknown"
 
 
-# note(chenghua): Re-export name -> defining submodule. Resolved lazily on first access.
+# Re-export name -> defining submodule. Resolved lazily on first access.
 _LAZY: dict[str, str] = {
     # phyai.engine
     "Engine": "phyai.engine",

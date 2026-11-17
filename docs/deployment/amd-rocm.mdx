@@ -11,11 +11,9 @@ Tested on MI300X with the `rocm/sgl-dev:v0.5.22-rocm724-mi30x-20261029` image (R
 
 Start the image with the GPU devices passed through (`--device=/dev/kfd --device=/dev/dri`). It ships ROCm builds of Torch, TorchVision, Triton, and aiter in `/opt/venv`, at the Torch versions PhyAI pins.
 
-`phyai/pyproject_amd.toml` and `phyai-kernel/pyproject_amd.toml` declare the same dependencies as the default `pyproject.toml` files without the CUDA-only packages. Copy them over the defaults, then install the workspace packages into the image's environment:
+`phyai/pyproject_amd.toml` and `phyai-kernel/pyproject_amd.toml` declare the same dependencies as the default `pyproject.toml` files without the CUDA-only packages. From the provided source directory, copy them over the defaults, then install the workspace packages into the image's environment:
 
 ```bash
-git clone https://github.com/mingti-org/phyai.git
-cd phyai
 cp phyai/pyproject_amd.toml phyai/pyproject.toml
 cp phyai-kernel/pyproject_amd.toml phyai-kernel/pyproject.toml
 source /opt/venv/bin/activate

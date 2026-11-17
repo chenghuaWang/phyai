@@ -14,7 +14,7 @@ from phyai.kernel.selector import Selector
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from phyai.kernel.config import KernelConfig
 
-# note(chenghua.wang): Single process can only hold single engine and single selector.
+# A single process can only hold a single engine and a single selector.
 _selector: Selector | None = None
 
 

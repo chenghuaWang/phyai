@@ -6,52 +6,21 @@
   </picture>
 </p>
 
-<p align="center">
-  <a href="https://mingti-org.github.io/phyai-blog/"><img alt="Blog" src="https://img.shields.io/badge/blog-PhyAI-8B5CF6"></a>
-  <a href="https://phyai.mintlify.app/"><img alt="Docs" src="https://img.shields.io/badge/docs-phyai-2563EB"></a>
-  <a href="https://github.com/mingti-org/phyai"><img alt="GitHub" src="https://img.shields.io/badge/github-mingti--org%2Fphyai-181717?logo=github"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/mingti-org/phyai.svg"></a>
-  <a href="https://github.com/mingti-org/phyai/issues"><img alt="open issues" src="https://img.shields.io/github/issues-raw/mingti-org/phyai"></a>
-  <a href="https://mingti-org.github.io/phyai/simple/"><img alt="Nightly" src="https://img.shields.io/badge/nightly-packages-60A5FA"></a>
-</p>
+# Anonymous review artifact
 
-----
-
-**PhyAI** (pronounced "phi") is a **latency-first serving engine for Physical AI**.
-It is designed first for latency critical workloads, such as policy and action
-models that run in interactive systems.
-
-https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
+The `phyai` packages provide an inference and serving engine for physical AI
+models, including policy and action models used in interactive systems.
 
 <p align="center">
   <img src="assets/phyai-demo.gif" alt="PhyAI and OpenPI deployment comparison" width="100%">
 </p>
 
-## News
-
-- [2026/11] With the support of the AMD AIG Team, PhyAI supports inference on [AMD Instinct MI300X](https://phyai.mintlify.app/deployment/amd-rocm) (experimental).
-- [2026/11] Support [VPP2](https://phyai.mintlify.app/models/vpp2/inference) action and video inference with TP and video CFG parallelism.
-- [2026/11] 🤗 Support [HumanWAM-Goal](https://phyai.mintlify.app/models/humanwam-goal/inference), [arxiv](https://arxiv.org/pdf/2611.06817).
-- [2026/11] Support [LingBot V2](https://phyai.mintlify.app/models/lingbot_v2/inference).
-- [2026/10] Support [DreamZero](https://phyai.mintlify.app/models/dreamzero/ws1).
-- [2026/10] Support [Xiaomi Robotics U0](https://phyai.mintlify.app/models/xiaomi-u0/text-to-image) text-to-image generation.
-- [2026/10] Support [MolmoAct2](https://phyai.mintlify.app/models/molmoact2/inference).
-- [2026/10] Support [PhyAI gateway](https://phyai.mintlify.app/deployment/server-gateway) for multi-host serving and LeRobot clients.
-- [2026/09] 🚀 Support Qwen-Image 2.1! [doc](https://phyai.mintlify.app/models/qwen-image/generation).
-- [2026/09] 🤗 Support PI0.5 RL rollout for PPO ([RLinf PR #1587](https://github.com/RLinf/RLinf/pull/1587)).
-- [2026/07] 🚀 Day 0 support for MiniCPM-Robotic [blog](https://mingti-org.github.io/phyai-blog/blogs/260719-day-0-minicpm-robotic/).
-- [2026/07] 👏 Introducing PhyAI, a latency-first serving engine for Physical AI. [Read the Blog](https://mingti-org.github.io/phyai-blog/blogs/260718-phyai/).
-- [2026/07] Support [PI0](https://phyai.mintlify.app/models/pi0/ws1).
-- [2026/07] Support Cosmos3-Super with TP and CFG parallelism in the unified Cosmos3 [generation path](https://phyai.mintlify.app/models/cosmos/generation).
-- [2026/06] Support [Pi0.5](https://phyai.mintlify.app/models/pi05/ws1) and Cosmos3-Nano's [policy mode](https://phyai.mintlify.app/models/cosmos/policy) and [generation mode](https://phyai.mintlify.app/models/cosmos/generation).
-
-
 ## Key Features
 
-- 🚀 Runs on NVIDIA Jetson edge devices
-- 🚀 Scales to GPU clusters with DP, TP, and CFG parallelism
-- 🚀 Uses high-performance kernels from FlashInfer and Humming
-- 🤗 Supports INT4, INT8, FP8, MXFP4, and NVFP4 quantization through [kernel policies](#quantization) (PR under review)
+- Runs on NVIDIA Jetson edge devices
+- Scales to GPU clusters with DP, TP, and CFG parallelism
+- Uses high-performance kernels from FlashInfer and Humming
+- Supports INT4, INT8, FP8, MXFP4, and NVFP4 quantization through [kernel policies](#quantization)
 
 ## Supported Models
 
@@ -60,39 +29,39 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
     <tr>
       <th align="center" width="22%">VLA</th>
       <td align="center">
-        <a href="https://phyai.mintlify.app/models/pi0/ws1"><strong>&pi;0</strong></a>,
-        <a href="https://phyai.mintlify.app/models/pi05/ws1"><strong>&pi;0.5</strong></a>,
-        <a href="https://phyai.mintlify.app/models/gr00t/ws1"><strong>GR00T N1.7</strong></a>,
+        <a href="docs/models/pi0/ws1.mdx"><strong>&pi;0</strong></a>,
+        <a href="docs/models/pi05/ws1.mdx"><strong>&pi;0.5</strong></a>,
+        <a href="docs/models/gr00t/ws1.mdx"><strong>GR00T N1.7</strong></a>,
         <a href="examples/minicpm_gr00t/README.md"><strong>MiniCPM-Robot</strong></a>,
-        <a href="https://phyai.mintlify.app/models/molmoact2/inference"><strong>MolmoAct2</strong></a>,
-        <a href="https://phyai.mintlify.app/models/lingbot_v2/inference"><strong>LingBot V2</strong></a>
+        <a href="docs/models/molmoact2/inference.mdx"><strong>MolmoAct2</strong></a>,
+        <a href="docs/models/lingbot_v2/inference.mdx"><strong>LingBot V2</strong></a>
       </td>
     </tr>
     <tr>
       <th align="center" width="22%">WAM</th>
       <td align="center">
-        <a href="https://phyai.mintlify.app/models/cosmos/policy"><strong>Cosmos3-Nano-Policy-DROID</strong></a>(w/ TP, CFG Parallel),
-        <a href="https://phyai.mintlify.app/models/dreamzero/ws1"><strong>DreamZero</strong></a>,
+        <a href="docs/models/cosmos/policy.mdx"><strong>Cosmos3-Nano-Policy-DROID</strong></a>(w/ TP, CFG Parallel),
+        <a href="docs/models/dreamzero/ws1.mdx"><strong>DreamZero</strong></a>,
         <a href="docs/models/humanwam-goal/inference.mdx"><strong>HumanWAM-Goal</strong></a>,
-        <a href="https://phyai.mintlify.app/models/vpp2/inference"><strong>VPP2</strong></a>
+        <a href="docs/models/vpp2/inference.mdx"><strong>VPP2</strong></a>
       </td>
     </tr>
     <tr>
       <th align="center" width="22%">Foundation Model</th>
       <td align="center">
-        <a href="https://phyai.mintlify.app/models/cosmos/generation"><strong>Cosmos3-Nano</strong></a>(w/ TP, CFG Parallel),
-        <a href="https://phyai.mintlify.app/models/cosmos/generation"><strong>Cosmos3-Super</strong></a>(w/ TP, CFG Parallel),
+        <a href="docs/models/cosmos/generation.mdx"><strong>Cosmos3-Nano</strong></a>(w/ TP, CFG Parallel),
+        <a href="docs/models/cosmos/generation.mdx"><strong>Cosmos3-Super</strong></a>(w/ TP, CFG Parallel),
         <a href="phyai/src/phyai/models/qwen3_5"><strong>Qwen3.5</strong></a>,
         <a href="phyai/src/phyai/models/qwen3_vl"><strong>Qwen3-VL</strong></a>,
-        <a href="https://phyai.mintlify.app/models/qwen-image/generation"><strong>Qwen-Image 2.1</strong></a>,
-        <a href="https://phyai.mintlify.app/models/xiaomi-u0/text-to-image"><strong>Xiaomi Robotics U0</strong></a> (T2I, X2I)
+        <a href="docs/models/qwen-image/generation.mdx"><strong>Qwen-Image 2.1</strong></a>,
+        <a href="docs/models/xiaomi-u0/text-to-image.mdx"><strong>Xiaomi Robotics U0</strong></a> (T2I, X2I)
       </td>
     </tr>
   </tbody>
 </table>
 
 All supported models can scale through data-parallel (DP) replicas using the
-shared scheduler. See [parallel serving](https://phyai.mintlify.app/deployment/parallel-serving#serving-replicas).
+shared scheduler. See [parallel serving](docs/deployment/parallel-serving.mdx#serving-replicas).
 
 ## Performance Comparison
 
@@ -102,26 +71,14 @@ shared scheduler. See [parallel serving](https://phyai.mintlify.app/deployment/p
 
 ## Installation
 
-See the [PhyAI installation guide](https://phyai.mintlify.app/) for the latest
-source and nightly package instructions.
-
-**From source:**
+See the [installation guide](docs/index.mdx) for prerequisites. From the root
+of the provided repository, install the workspace packages:
 
 ```bash
-git clone https://github.com/mingti-org/phyai
-cd phyai
 uv sync
 ```
 
-**Nightly build:**
-
-```bash
-uv pip install phyai phyai-ext \
-  --extra-index-url https://mingti-org.github.io/phyai/simple/ \
-  --prerelease=allow
-```
-
-**AMD ROCm (experimental):** see the [AMD ROCm guide](https://phyai.mintlify.app/deployment/amd-rocm).
+**AMD ROCm (experimental):** see the [AMD ROCm guide](docs/deployment/amd-rocm.mdx).
 
 ## Quantization
 
@@ -144,7 +101,7 @@ original precision. Point `--checkpoint` to your original, unquantized weights.
 
 Choose another [PI0.5 preset](examples/pi05/kernel_policies), or copy one and edit
 its `quantization` and kernel `rules`. See the
-[quantization guide](https://phyai.mintlify.app/quantization/overview) for matching
+[quantization guide](docs/quantization/overview.mdx) for matching
 layers, changing precision, and selecting kernels.
 
 ## Multi-host serving
@@ -178,75 +135,9 @@ curl http://127.0.0.1:30000/v1/backends
 
 Clients use the gateway host's HTTP port `30000` or gRPC port `50111`. The gateway
 distributes stateless requests across healthy replicas. See the
-[server and gateway setup guide](https://phyai.mintlify.app/deployment/server-gateway) for client
+[server and gateway setup guide](docs/deployment/server-gateway.mdx) for client
 configuration and adding or removing servers while the gateway is running.
-
-## Contribution Guidelines
-
-We thank the contributors below and welcome more developers to join us in building PhyAI.
-
-<a href="https://github.com/mingti-org/phyai/graphs/contributors"><img src="https://stg.contrib.rocks/image?repo=mingti-org/phyai&max=240&columns=18" /></a>
-
-## Sponsors & Adoption
-
-PhyAI is a latency-first, open-source serving engine for Physical AI. It is being adopted by companies working across AI infrastructure and robotics, including Mingti, ModelBest, RLInf and AMD.
-
-We are actively seeking partnerships with compute providers, chip vendors, and robotics companies. If you are interested in working with us, please [contact us](#contact).
-
-<table align="center" width="80%">
-  <tbody>
-    <tr>
-      <td align="center" width="25%">
-        <img src="assets/mingti-new.png" alt="Mingti" width="240">
-      </td>
-      <td align="center" width="25%">
-        <img src="assets/modelbest.svg" alt="ModelBest" width="240">
-      </td>
-      <td align="center" width="25%">
-        <img src="assets/logo_white.svg" alt="RLInf" width="240">
-      </td>
-      <td align="center" width="25%">
-        <img src="assets/amd.svg" alt="AMD" width="240">
-      </td>
-    </tr>
-  </tbody>
-</table>
-
-## Citation
-
-If you use PhyAI in research or production work, please cite the paper:
-
-```bibtex
-@misc{wang2026phyairealtimephysicalai,
-  title={PhyAI: Real-Time Physical AI at the Edge, Scalable Rollouts in the Cloud},
-  author={Chenghua Wang and Daliang Xu and Dongqi Cai and Duojin Sun and Hao Zhang and Haoze Qian and Huaiyuan Zhang and Jinshuo Cui and Junbo Cui and Kezhao Zhao and Longxi Gao and Mengwei Xu and Rongjie Yi and Ruixin Liu and Shangguang Wang and Tam Sikyuen and Tianyue Zhang and Weikai Xie and Xuanzhe Liu and Yingying Qin and Yiwen Lu and Yuan Yao and Yuezhi Zu and Yunhan Guo and Yuxin Zheng and Ziqi Guo},
-  year={2026},
-  eprint={2608.03682},
-  archivePrefix={arXiv},
-  primaryClass={cs.AI},
-  url={https://arxiv.org/abs/2608.03682},
-}
-```
-
-<a id="contact"></a>
-**Contact:**
-
-We welcome PhD and master's students who want to help build Physical AGI, especially those interested in systems infrastructure. We also want to work with chip and compute companies, as well as robotics companies that plan to deploy models with PhyAI.
-
-- PhyAI: [Maintainer](mailto:chenghua.wang.edu@gmail.com)
-- Mengwei Xu: [mwx@bupt.edu.cn](mailto:mwx@bupt.edu.cn)
-- Daliang Xu: [xudaliang@bupt.edu.cn](mailto:xudaliang@bupt.edu.cn)
 
 ## License
 
 PhyAI is released under the [MIT License](LICENSE). It uses [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Humming](https://github.com/inclusionAI/humming), and [FLA](https://github.com/fla-org/flash-linear-attention). We have also learned a great deal from [SGLang](https://github.com/sgl-project/sglang), [vLLM](https://github.com/vllm-project/vllm), and [TokenSpeed](https://github.com/lightseekorg/tokenspeed). We thank the maintainers and contributors of all these projects.
-
-## Demos
-
-### Cosmos3-Nano-Policy-DROID, 260718 nightly version
-
-https://github.com/user-attachments/assets/12a833ce-3b47-4f08-875c-b30cc2567bef
-
-https://github.com/user-attachments/assets/8e7d433c-e3b1-4388-8488-196836a1ba51
-
-https://github.com/user-attachments/assets/29067c88-f51a-4ca6-ab8c-b45f4d778923

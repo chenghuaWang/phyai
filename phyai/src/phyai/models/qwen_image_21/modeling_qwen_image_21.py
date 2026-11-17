@@ -1,4 +1,4 @@
-# Copyright 2026 Qwen-Image Team, The HuggingFace Team, PHYAI contributors.
+# Copyright 2026 Qwen-Image Team, The HuggingFace Team, Anonymous contributors.
 # Licensed under the Apache License, Version 2.0.
 """Stateless single-stream Qwen-Image 2.1 denoiser using PHYAI layers."""
 

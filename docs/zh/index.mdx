@@ -1,36 +1,28 @@
 ---
-title: "欢迎使用 PhyAI"
-description: "一起让 AGI 照进现实！"
+title: "推理框架"
+description: "从提交的源码安装并运行物理 AI 模型。"
 icon: 'star'
 mode: "wide"
 ---
 
 import { SetupCard } from "/snippets/setup-card.jsx"
 
-# PhyAI 是什么
+# 概述
 
-**PhyAI**（**Phy**sical **AI** Inference Framework，意为“物理 AI 推理框架”，读作 “phi”）是一个面向物理 AI 模型的高性能推理框架，支持 VLA、WAM 等模型及更多扩展场景，可同时用于云端服务和端侧部署。
+`phyai` 在端侧设备和 GPU 服务器上运行物理 AI 模型，包括视觉语言动作模型和世界动作模型。
 
 # 安装
+
+在提供的源码根目录运行以下命令。
 
 <SetupCard
   rows={{
     "OS": ["Ubuntu"],
     "Package": [
-      ["Package", "not upload to pypi yet"],
-      ["Source", `git clone https://github.com/mingti-org/phyai
-cd phyai
-uv sync
-source .venv/bin/activate`],
-      ["Docker", "not upload yet"]
+      ["Source", `uv sync
+source .venv/bin/activate`]
     ],
     "Device": ["Cloud/Consumer"],
     "Compute Platform": ["CUDA 13.0"],
   }}
 />
-
-如果你想安装 phyai 的 nightly 版本，请使用下面的命令：
-
-```shell
-uv pip install phyai phyai_ext --extra-index-url https://mingti-org.github.io/phyai/simple/ --prerelease=allow
-```

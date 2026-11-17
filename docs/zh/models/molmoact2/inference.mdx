@@ -16,7 +16,7 @@ description: "下载 MolmoAct2、运行动作推理，并为应用准备相机�
 | 输入 | 三路 RGB 相机输入、8 维状态向量和任务指令 |
 | 输出 | 后处理后得到 CPU 上的 `float32` 动作张量，形状为 `(1, 15, 8)` |
 | 推理 | BF16、10 步 flow matching，启用 CUDA Graph |
-| 示例脚本 | [run_molmoact2.py](https://github.com/mingti-org/phyai/blob/main/examples/molmoact2/run_molmoact2.py) |
+| 示例脚本 | `examples/molmoact2/run_molmoact2.py` |
 
 <Note>
   `allenai/MolmoAct2` 是面向多种机器人形态的基础 checkpoint，用于后续机器人任务微调。
@@ -27,14 +27,12 @@ description: "下载 MolmoAct2、运行动作推理，并为应用准备相机�
 ## 快速开始
 
 你需要 Linux、Python 3.12 或更新版本、`uv`，以及支持 BF16 且有足够空闲显存加载模型的
-NVIDIA GPU。CUDA 环境见[安装说明](/zh/index#setup)。以下命令在 PhyAI 仓库根目录运行。
+NVIDIA GPU。CUDA 环境见[安装说明](/zh/index)。以下命令在提供的源码根目录运行。
 
 <Steps>
 <Step title="安装 PhyAI">
 
 ```bash
-git clone https://github.com/mingti-org/phyai
-cd phyai
 uv sync
 source .venv/bin/activate
 ```

@@ -8,10 +8,9 @@ review discussions.
 
 ## Before you start
 
-Search the [issue tracker](https://github.com/mingti-org/phyai/issues) before
-opening a new issue or starting a large change. For changes that affect public
+For changes that affect public
 APIs, shared layers, runtime behavior, checkpoint formats, or hard dependency
-pins, open an issue first and describe the proposed contract. A short design
+pins, describe the proposed contract before implementing it. A short design
 discussion can prevent incompatible work in these shared areas.
 
 Keep each pull request focused on one problem. If a change needs unrelated
@@ -23,15 +22,7 @@ PhyAI is a `uv` workspace and requires Python 3.12 or newer. A working C/C++
 toolchain is needed to build `phyai-ext`. The test suite also requires a
 CUDA-capable NVIDIA GPU.
 
-Fork the repository, clone your fork, and add the main repository as an
-upstream remote:
-
-```bash
-git clone https://github.com/<your-user>/phyai.git
-cd phyai
-git remote add upstream https://github.com/mingti-org/phyai.git
-git switch -c fix/short-description
-```
+Run the following commands from the provided source directory.
 
 The setup script installs the editable workspace and pre-commit hooks. It also
 installs the Mintlify CLI when `npm` is available.

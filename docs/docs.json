@@ -264,13 +264,6 @@
     "light": "/logo/light.png",
     "dark": "/logo/dark.png"
   },
-  "navbar": {
-    "links": [],
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/mingti-org/phyai"
-    }
-  },
   "contextual": {
     "options": [
       "copy",
@@ -282,10 +275,5 @@
       "cursor",
       "vscode"
     ]
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/mingti-org/phyai"
-    }
   }
 }

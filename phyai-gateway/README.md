@@ -4,7 +4,7 @@ PhyAI gateway gives your inference client one address for model servers running 
 
 ## Start the gateway
 
-Run the commands below from the repository root. If you need to start a model server, follow the [server setup guide](https://phyai.mintlify.app/deployment/server-gateway) ([中文](https://phyai.mintlify.app/zh/deployment/server-gateway)) to prepare its YAML configuration, then run:
+Run the commands below from the repository root. If you need to start a model server, follow the [server setup guide](../docs/deployment/server-gateway.mdx) ([中文](../docs/zh/deployment/server-gateway.mdx)) to prepare its YAML configuration, then run:
 
 ```bash
 uv run --package phyai phyai server server.yaml
@@ -48,7 +48,7 @@ uv run --package phyai-gateway --extra lerobot phyai-gateway \
 
 Replace `your-org/your-policy` with the client's existing `pretrained_name_or_path`, and set the server YAML's `server.model_name` to the same value. Point the client's `server_address` at `GATEWAY_HOST:50111`, and match `--lerobot-fps` to its control rate.
 
-The [setup guide](https://phyai.mintlify.app/deployment/server-gateway#connect-a-lerobot-client) explains how to match the server's camera and action settings to your robot. The client's request and response formats stay unchanged. Enable LeRobot only for clients you trust, since its protocol uses pickle.
+The [setup guide](../docs/deployment/server-gateway.mdx#connect-a-lerobot-client) explains how to match the server's camera and action settings to your robot. The client's request and response formats stay unchanged. Enable LeRobot only for clients you trust, since its protocol uses pickle.
 
 ## Use more than one server
 

@@ -16,8 +16,6 @@
 # - RMSNorm reduction order, compiled RoPE, and GEMM selection add smaller
 #   numerical differences.
 # - Repeated Euler updates can amplify these differences.
-#
-# Author: chenghua.wang
 
 schema: phyai.kernel/v1
 profile: static
